@@ -14,6 +14,12 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 pub const WINDOW_W: f32 = 560.0;
 pub const WINDOW_H: f32 = 430.0;
 
+/// A caixinha do modo rapido, do tamanho de um menu de contexto.
+const HUD_W: f32 = 290.0;
+const HUD_H: f32 = 44.0;
+/// Quanto tempo a caixinha fica na tela depois de um erro, ja que ninguem vai fecha-la.
+const HUD_ERROR_LINGER: Duration = Duration::from_secs(5);
+
 /// Onde a janela estaciona enquanto esta escondida: fora de qualquer monitor.
 ///
 /// Nao da para confiar so no `Visible(false)`. O eframe forca `set_visible(true)` assim que o
@@ -41,6 +47,15 @@ enum Status {
     Error(String),
 }
 
+/// A janela e uma so; o que muda e o que ela desenha.
+#[derive(PartialEq, Clone, Copy)]
+enum Mode {
+    /// O popup completo, com tons, resultado editavel e acoes.
+    Popup,
+    /// A caixinha do atalho rapido: so diz em que pe esta o trabalho.
+    Hud,
+}
+
 /// Pedido vindo da thread do atalho global.
 struct ShowRequest {
     hwnd: isize,
@@ -63,6 +78,8 @@ struct QuickJob {
     generation: u64,
     buffer: String,
     previous_clipboard: Option<String>,
+    /// Onde a caixinha nasceu, para um erro tardio reaparecer no mesmo lugar.
+    cursor: (i32, i32),
 }
 
 pub struct App {
@@ -85,9 +102,13 @@ pub struct App {
     show_settings: bool,
     show_original: bool,
     toast: Option<(String, Instant)>,
-    /// Ultimo resultado do modo rapido, que nao tem janela para reportar sozinho.
+    /// Ultimo resultado do modo rapido, mostrado como aviso na proxima abertura do popup.
     quick_note: Option<(String, bool)>,
     quick: Option<QuickJob>,
+    mode: Mode,
+    hud_message: String,
+    /// Quando o erro apareceu na caixinha, para ela sumir sozinha.
+    hud_error_since: Option<Instant>,
 
     llm_tx: Sender<(u64, Msg)>,
     llm_rx: Receiver<(u64, Msg)>,
@@ -153,6 +174,9 @@ impl App {
             toast: None,
             quick_note: None,
             quick: None,
+            mode: Mode::Popup,
+            hud_message: String::new(),
+            hud_error_since: None,
             llm_tx,
             llm_rx,
             quick_tx,
@@ -179,7 +203,27 @@ impl App {
         )));
     }
 
-    fn show_window(&mut self, ctx: &egui::Context, cursor: Option<(i32, i32)>) {
+    fn show_popup(&mut self, ctx: &egui::Context, cursor: Option<(i32, i32)>) {
+        self.mode = Mode::Popup;
+        self.hud_error_since = None;
+        self.show_window(ctx, cursor, egui::vec2(WINDOW_W, WINDOW_H), true);
+    }
+
+    /// A caixinha nao pode roubar o foco: o texto melhorado precisa voltar para a janela de
+    /// origem, e ela tem que continuar sendo a janela ativa ate a hora de colar.
+    fn show_hud(&mut self, ctx: &egui::Context, cursor: (i32, i32)) {
+        self.mode = Mode::Hud;
+        self.hud_error_since = None;
+        self.show_window(ctx, Some(cursor), egui::vec2(HUD_W, HUD_H), false);
+    }
+
+    fn show_window(
+        &mut self,
+        ctx: &egui::Context,
+        cursor: Option<(i32, i32)>,
+        size: egui::Vec2,
+        focus: bool,
+    ) {
         let ppp = ctx.pixels_per_point().max(0.1);
         let monitor = ctx.input(|i| i.viewport().monitor_size);
 
@@ -188,20 +232,23 @@ impl App {
                 let mut px = x as f32 / ppp + 12.0;
                 let mut py = y as f32 / ppp + 12.0;
                 if let Some(monitor) = monitor {
-                    px = px.min(monitor.x - WINDOW_W - 8.0).max(8.0);
-                    py = py.min(monitor.y - WINDOW_H - 8.0).max(8.0);
+                    px = px.min(monitor.x - size.x - 8.0).max(8.0);
+                    py = py.min(monitor.y - size.y - 8.0).max(8.0);
                 }
                 egui::pos2(px, py)
             }
             None => match monitor {
-                Some(monitor) => egui::pos2((monitor.x - WINDOW_W) / 2.0, (monitor.y - WINDOW_H) / 2.0),
+                Some(monitor) => egui::pos2((monitor.x - size.x) / 2.0, (monitor.y - size.y) / 2.0),
                 None => egui::pos2(200.0, 200.0),
             },
         };
 
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if focus {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.visible.store(true, Ordering::SeqCst);
         self.ui_ran = false;
     }
@@ -216,6 +263,7 @@ impl App {
         // Uma geracao nova invalida o stream do popup em andamento (o modo rapido tem a sua).
         self.generation += 1;
         self.show_settings = false;
+        self.hud_error_since = None;
         self.visible.store(false, Ordering::SeqCst);
         self.ui_ran = false;
         self.park_offscreen(ctx);
@@ -248,13 +296,14 @@ impl App {
         });
     }
 
-    /// Modo rapido: nenhuma janela abre, nem no erro. O retorno vai para o tooltip da bandeja e
-    /// para o aviso mostrado da proxima vez que o popup abrir.
+    /// Modo rapido: sem popup, so a caixinha ao lado do cursor dizendo em que pe esta. No fim ela
+    /// some sozinha e o texto melhorado entra no lugar do original.
     fn start_quick(&mut self, ctx: &egui::Context, req: ShowRequest) {
+        let cursor = req.cursor;
         let text = req.text.trim().to_string();
         if text.is_empty() {
             restore_clipboard(req.previous_clipboard);
-            self.note_quick("nada selecionado", true);
+            self.fail_quick(ctx, cursor, "nada selecionado");
             return;
         }
 
@@ -265,11 +314,14 @@ impl App {
             generation,
             buffer: String::new(),
             previous_clipboard: req.previous_clipboard,
+            cursor,
         });
+        let tone = self.cfg.tone(self.tone_index).clone();
+        self.hud_message = format!("melhorando · {}", tone.name);
         self.note_quick("melhorando...", false);
+        self.show_hud(ctx, cursor);
 
         let cfg = self.cfg.clone();
-        let tone = cfg.tone(self.tone_index).clone();
         let tx = self.quick_tx.clone();
         let ctx = ctx.clone();
 
@@ -280,6 +332,14 @@ impl App {
             };
             llm::stream_improve(&cfg, &tone, &text, "", generation, &tx, repaint);
         });
+    }
+
+    /// Erro do modo rapido: a caixinha mostra o motivo e se apaga sozinha.
+    fn fail_quick(&mut self, ctx: &egui::Context, cursor: (i32, i32), message: &str) {
+        self.note_quick(message, true);
+        self.hud_message = message.to_string();
+        self.show_hud(ctx, cursor);
+        self.hud_error_since = Some(Instant::now());
     }
 
     fn note_quick(&mut self, message: &str, is_error: bool) {
@@ -317,7 +377,7 @@ impl App {
                     self.output.clear();
                     self.show_settings = false;
                     self.show_original = false;
-                    self.show_window(ctx, Some(req.cursor));
+                    self.show_popup(ctx, Some(req.cursor));
                     self.start_generation(ctx);
                 }
             }
@@ -337,7 +397,7 @@ impl App {
             }
         }
 
-        self.drain_quick();
+        self.drain_quick(ctx);
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.tray_quit_id {
@@ -354,7 +414,7 @@ impl App {
         }
     }
 
-    fn drain_quick(&mut self) {
+    fn drain_quick(&mut self, ctx: &egui::Context) {
         while let Ok((generation, msg)) = self.quick_rx.try_recv() {
             if self.quick.as_ref().map(|job| job.generation) != Some(generation) {
                 continue;
@@ -370,19 +430,23 @@ impl App {
                     let text = job.buffer.trim().to_string();
                     if text.is_empty() {
                         restore_clipboard(job.previous_clipboard);
-                        self.note_quick("resposta vazia", true);
-                    } else {
-                        let hwnd = job.hwnd;
-                        std::thread::spawn(move || {
-                            let _ = win::paste_into(hwnd, &text);
-                        });
-                        self.note_quick("colado", false);
+                        self.fail_quick(ctx, job.cursor, "resposta vazia");
+                        continue;
                     }
+                    // A caixinha sai da frente antes de colar: o foco precisa voltar inteiro para
+                    // a janela de origem, senao o Ctrl+V cai no lugar errado.
+                    self.hide_window(ctx, false);
+                    self.note_quick("colado", false);
+                    let hwnd = job.hwnd;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        let _ = win::paste_into(hwnd, &text);
+                    });
                 }
                 Msg::Error(err) => {
                     let Some(job) = self.quick.take() else { continue };
                     restore_clipboard(job.previous_clipboard);
-                    self.note_quick(&err, true);
+                    self.fail_quick(ctx, job.cursor, &err);
                 }
             }
         }
@@ -391,7 +455,7 @@ impl App {
     fn open_settings(&mut self, ctx: &egui::Context) {
         self.draft = self.cfg.clone();
         self.show_settings = true;
-        self.show_window(ctx, None);
+        self.show_popup(ctx, None);
     }
 
     fn begin_quit(&mut self, ctx: &egui::Context) {
@@ -447,6 +511,13 @@ impl eframe::App for App {
             }
         }
 
+        // A caixinha de erro do modo rapido nao tem quem a feche: ela se apaga.
+        if let Some(since) = self.hud_error_since {
+            if since.elapsed() > HUD_ERROR_LINGER {
+                self.hide_window(ctx, false);
+            }
+        }
+
         // `ui()` rodou mas o app se considera escondido: alguem exibiu a janela pelas costas
         // (o eframe faz isso depois do primeiro frame). Reafirma o estado desejado.
         if self.ui_ran && !self.is_visible() {
@@ -480,6 +551,11 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.hide_window(ctx, true);
+            return;
+        }
+
+        if self.mode == Mode::Hud {
+            self.hud_ui(ui);
             return;
         }
 
@@ -521,12 +597,44 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// A caixinha do modo rapido: uma linha, do tamanho de um menu de contexto.
+    fn hud_ui(&mut self, ui: &mut egui::Ui) {
+        let failed = self.hud_error_since.is_some();
+        let frame = egui::Frame::new()
+            .fill(BG)
+            .inner_margin(egui::Margin::symmetric(12, 10));
+
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if failed {
+                    ui.label(egui::RichText::new(crate::icon::WARNING).size(15.0).color(DANGER));
+                } else {
+                    ui.add(egui::Spinner::new().size(13.0).color(ACCENT));
+                }
+                ui.add_space(2.0);
+                let color = if failed { DANGER } else { TEXT };
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.hud_message).size(12.0).color(color))
+                        .truncate(),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(crate::icon::LIGHTNING)
+                            .size(13.0)
+                            .color(MUTED),
+                    );
+                });
+            });
+        });
+    }
+
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             // A marca inteira e a alca de arrasto: a janela nao tem barra de titulo.
             let brand = ui.add(
                 egui::Label::new(
-                    egui::RichText::new("better-answer")
+                    egui::RichText::new(format!("{}  better-answer", crate::icon::SPARKLE))
                         .size(12.5)
                         .strong()
                         .color(TEXT),
@@ -539,10 +647,10 @@ impl App {
             ui.label(egui::RichText::new(&self.cfg.model).size(11.0).color(MUTED));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, "×").on_hover_text("Esc").clicked() {
+                if icon_button(ui, crate::icon::X).on_hover_text("Esc").clicked() {
                     self.hide_window(ctx, true);
                 }
-                if icon_button(ui, "⚙").on_hover_text("Configuração").clicked() {
+                if icon_button(ui, crate::icon::GEAR).on_hover_text("Configuração").clicked() {
                     self.show_settings = !self.show_settings;
                     if self.show_settings {
                         self.draft = self.cfg.clone();
@@ -553,7 +661,9 @@ impl App {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("original").size(10.5).color(color),
+                                egui::RichText::new(crate::icon::TEXT_ALIGN_LEFT)
+                                    .size(15.0)
+                                    .color(color),
                             )
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(egui::Stroke::NONE)
@@ -580,7 +690,7 @@ impl App {
         // Aviso do modo rapido: ele nao tem janela, entao reporta aqui na proxima abertura.
         if let Some((message, true)) = self.quick_note.as_ref().map(|(m, e)| (m.clone(), *e)) {
             ui.add_space(8.0);
-            banner(ui, DANGER, &format!("atalho rápido: {message}"));
+            banner(ui, DANGER, &format!("{}  atalho rápido: {message}", crate::icon::WARNING));
         }
 
         // Sem selecao o campo original vira o caminho principal, entao abre sozinho.
@@ -709,7 +819,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("›").size(14.0).color(ACCENT));
+                    ui.label(egui::RichText::new(crate::icon::CARET_RIGHT).size(13.0).color(ACCENT));
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.instruction)
                             .frame(egui::Frame::NONE)
@@ -753,7 +863,11 @@ impl App {
                 if ui
                     .add_enabled(
                         ready,
-                        egui::Button::new(egui::RichText::new("Substituir").size(11.5).color(BG))
+                        egui::Button::new(
+                            egui::RichText::new(format!("{}  Substituir", crate::icon::CHECK))
+                                .size(11.5)
+                                .color(BG),
+                        )
                             .fill(ACCENT)
                             .corner_radius(8.0),
                     )
@@ -762,11 +876,11 @@ impl App {
                 {
                     self.apply_replace(ctx);
                 }
-                if ghost_button(ui, "Copiar", ready).on_hover_text("Ctrl+Shift+C").clicked() {
+                if ghost_button(ui, &format!("{}  Copiar", crate::icon::COPY), ready).on_hover_text("Ctrl+Shift+C").clicked() {
                     self.apply_copy(ctx);
                     self.toast("copiado");
                 }
-                if ghost_button(ui, "Refazer", true).on_hover_text("Ctrl+R").clicked() {
+                if ghost_button(ui, &format!("{}  Refazer", crate::icon::ARROW_CLOCKWISE), true).on_hover_text("Ctrl+R").clicked() {
                     self.start_generation(ctx);
                 }
             });
@@ -1137,6 +1251,10 @@ fn tray_icon_image() -> tray_icon::Icon {
 }
 
 fn style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    crate::icon::install(&mut fonts);
+    ctx.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
     visuals.window_fill = BG;

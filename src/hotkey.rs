@@ -129,8 +129,9 @@ mod tests {
         assert_eq!(open.mods, Modifiers::CONTROL);
         assert_eq!(open.key, Code::KeyB);
 
-        let quick = parse("alt+b").unwrap();
-        assert_eq!(quick.mods, Modifiers::ALT);
+        // `HotKey::new` troca META por SUPER, e o backend win32 manda SUPER como MOD_WIN.
+        let quick = parse("win+b").unwrap();
+        assert_eq!(quick.mods, Modifiers::SUPER);
         assert_eq!(quick.key, Code::KeyB);
 
         // Os dois atalhos precisam ser distinguiveis: o app roteia pelo id.

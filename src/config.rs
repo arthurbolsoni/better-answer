@@ -21,7 +21,7 @@ pub struct Config {
     pub model: String,
     /// Abre o popup. Ex.: "ctrl+b", "ctrl+alt+e", "ctrl+shift+space".
     pub hotkey: String,
-    /// Melhora com o tom padrao e cola direto, sem abrir janela. Vazio desliga.
+    /// Melhora com o tom padrao e cola direto, so com a caixinha de progresso. Vazio desliga.
     pub quick_hotkey: String,
     pub temperature: f32,
     pub max_tokens: u32,
@@ -39,7 +39,7 @@ impl Default for Config {
             api_key: String::new(),
             model: "anthropic/claude-sonnet-5".to_string(),
             hotkey: "ctrl+b".to_string(),
-            quick_hotkey: "alt+b".to_string(),
+            quick_hotkey: "win+b".to_string(),
             temperature: 0.4,
             max_tokens: 2000,
             signature: String::new(),
@@ -120,7 +120,7 @@ mod tests {
     fn defaults_ship_both_hotkeys() {
         let cfg = Config::default();
         assert_eq!(cfg.hotkey, "ctrl+b");
-        assert_eq!(cfg.quick_hotkey, "alt+b");
+        assert_eq!(cfg.quick_hotkey, "win+b");
         assert!(crate::hotkey::parse(&cfg.hotkey).is_ok());
         assert!(crate::hotkey::parse(&cfg.quick_hotkey).is_ok());
     }
@@ -130,7 +130,7 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let cfg: Config = toml::from_str(r#"model = "algum/modelo""#).unwrap();
         assert_eq!(cfg.model, "algum/modelo");
-        assert_eq!(cfg.quick_hotkey, "alt+b");
+        assert_eq!(cfg.quick_hotkey, "win+b");
         assert!(!cfg.tones.is_empty());
     }
 

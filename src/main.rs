@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod hotkey;
+mod icon;
 mod llm;
 mod win;
 
