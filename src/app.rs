@@ -218,26 +218,35 @@ impl App {
         focus: bool,
     ) {
         let ppp = ctx.pixels_per_point().max(0.1);
-        let monitor = ctx.input(|i| i.viewport().monitor_size);
 
-        let pos = match cursor {
-            Some((x, y)) => {
-                let mut px = x as f32 / ppp + 12.0;
-                let mut py = y as f32 / ppp + 12.0;
-                if let Some(monitor) = monitor {
-                    px = px.min(monitor.x - size.x - 8.0).max(8.0);
-                    py = py.min(monitor.y - size.y - 8.0).max(8.0);
-                }
-                egui::pos2(px, py)
+        // Tudo em pixels fisicos, que e a unidade do cursor e da area util; a conversao para
+        // pontos logicos acontece so na hora de mandar o comando.
+        let anchor = cursor.unwrap_or_else(win::cursor_pos);
+        let (left, top, right, bottom) = win::work_area_at(anchor);
+        let width = (size.x * ppp).round() as i32;
+        let height = (size.y * ppp).round() as i32;
+
+        let (x, y) = match cursor {
+            Some((cx, cy)) => {
+                let gap = (12.0 * ppp).round() as i32;
+                (cx + gap, cy + gap)
             }
-            None => match monitor {
-                Some(monitor) => egui::pos2((monitor.x - size.x) / 2.0, (monitor.y - size.y) / 2.0),
-                None => egui::pos2(200.0, 200.0),
-            },
+            None => (
+                left + (right - left - width) / 2,
+                top + (bottom - top - height) / 2,
+            ),
         };
 
+        // O `.max(left/top)` vem depois do `.min` de proposito: numa janela maior que a area util,
+        // ele ganha e a janela encosta no canto superior esquerdo em vez de sumir para cima.
+        let x = x.min(right - width).max(left);
+        let y = y.min(bottom - height).max(top);
+
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            x as f32 / ppp,
+            y as f32 / ppp,
+        )));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         if focus {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -623,20 +632,32 @@ impl App {
     }
 
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            // A marca inteira e a alca de arrasto: a janela nao tem barra de titulo.
-            let brand = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("{}  better-answer", crate::icon::SPARKLE))
-                        .size(12.5)
-                        .strong()
-                        .color(TEXT),
-                )
-                .sense(egui::Sense::drag()),
+        // A janela nao tem barra de titulo, entao a faixa inteira do cabecalho vira alca. Um
+        // titulo estreito nao bastava: encostada na borda da tela, sobrava quase nada para agarrar.
+        // A area de arrasto e reservada antes do conteudo, e os botoes desenhados depois ficam por
+        // cima dela — quem clica no X fecha, quem clica no vazio arrasta.
+        let (bar, drag) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 22.0),
+            egui::Sense::drag(),
+        );
+        if drag.drag_started() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        drag.on_hover_cursor(egui::CursorIcon::Grab);
+
+        let mut ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bar)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let ui = &mut ui;
+        {
+            ui.label(
+                egui::RichText::new(format!("{}  better-answer", crate::icon::SPARKLE))
+                    .size(12.5)
+                    .strong()
+                    .color(TEXT),
             );
-            if brand.drag_started() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
             ui.label(egui::RichText::new(&self.cfg.model).size(11.0).color(MUTED));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -669,7 +690,7 @@ impl App {
                     }
                 }
             });
-        });
+        }
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

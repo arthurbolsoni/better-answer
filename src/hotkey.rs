@@ -121,9 +121,9 @@ mod tests {
         assert_eq!(open.mods, CTRL);
         assert_eq!(open.vk, 0x42);
 
-        let quick = parse("win+b").unwrap();
-        assert_eq!(quick.mods, WIN);
-        assert_eq!(quick.vk, 0x42);
+        let quick = parse("ctrl+s").unwrap();
+        assert_eq!(quick.mods, CTRL);
+        assert_eq!(quick.vk, 0x53);
 
         // O roteamento e por atalho: os dois precisam ser distinguiveis.
         assert_ne!(open, quick);

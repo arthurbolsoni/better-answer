@@ -9,29 +9,32 @@ Dois atalhos:
 | Atalho | O que faz |
 |---|---|
 | `Ctrl+B` | Abre o popup ao lado do cursor com a versão melhorada. `Ctrl+Enter` cola por cima do original. |
-| `Win+B` | Melhora com o tom padrão e substitui o texto selecionado. Só aparece uma caixinha ao lado do cursor com o progresso, do tamanho de um menu de contexto. |
+| `Ctrl+S` | Melhora com o tom padrão e substitui o texto selecionado. Só aparece uma caixinha ao lado do cursor com o progresso, do tamanho de um menu de contexto. |
 
 ## Como funciona
 
 1. O app fica na bandeja do sistema, sem janela.
-2. O atalho global (`RegisterHotKey`) dispara a captura: ele solta os modificadores ainda
-   pressionados, envia `Ctrl+C` sintético via `SendInput` e observa o
-   `GetClipboardSequenceNumber` até o app de origem responder. Esse é o único caminho que funciona
-   igual em Chrome, Outlook, Teams, Electron e terminal.
-3. O texto vai para a OpenRouter com streaming SSE; o resultado aparece token a token.
-4. `Substituir` devolve o foco para a janela de origem e envia `Ctrl+V`.
+2. Os atalhos vivem num hook `WH_KEYBOARD_LL`, não no `RegisterHotKey`: combos que o shell usa
+   para si (`Win+B` foca a área de notificação) são tratados por ele antes de chegarem ao app, e
+   o registro simplesmente falha. O hook vê a tecla antes de todo mundo e a engole.
+3. O atalho dispara a captura: solta os modificadores ainda pressionados, envia `Ctrl+C` sintético
+   via `SendInput` e observa o `GetClipboardSequenceNumber` até o app de origem responder. Esse é
+   o único caminho que funciona igual em Chrome, Outlook, Teams, Electron e terminal.
+4. O texto vai para a OpenRouter com streaming SSE; o resultado aparece token a token.
+5. `Substituir` devolve o foco para a janela de origem e envia `Ctrl+V`.
 
 Se você cancelar (`Esc`), o clipboard anterior é restaurado.
 
 ### O atalho rápido nunca rouba o foco
 
-`Win+B` mostra só a caixinha de progresso, e ela não recebe foco: a janela de origem continua sendo a
+`Ctrl+S` mostra só a caixinha de progresso, e ela não recebe foco: a janela de origem continua sendo a
 ativa, que é o que faz o `Ctrl+V` do final cair no lugar certo. Deu erro, a caixinha mostra o motivo,
 some sozinha depois de 5s e o clipboard anterior é restaurado. O erro também vai para o tooltip da
 bandeja e vira um aviso na próxima vez que o popup abrir.
 
-`Alt+<letra>` não serve para esse atalho: a janela em foco recebe o `WM_SYSKEYDOWN` do Alt mesmo com
-o `RegisterHotKey` engolindo a letra, e ao soltar o Alt o `DefWindowProc` abre a barra de menu dela.
+Alt e Win têm ação própria quando são soltos sem nenhuma tecla no meio — barra de menu e Menu
+Iniciar. Como o hook engole a tecla principal, o modificador vira um toque isolado; por isso a
+captura injeta antes uma tecla sem função (VK `0xE8`), o mesmo recurso que o AutoHotkey usa.
 
 ## Instalação
 
@@ -73,7 +76,7 @@ Primeira execução cria `%APPDATA%\better-answer\config.toml`:
 | `api_key` | Chave da OpenRouter. **Prefira deixar vazio** e usar a variável de ambiente `OPENROUTER_API_KEY`. |
 | `model` | Ex.: `anthropic/claude-sonnet-5`, `google/gemini-3.5-flash`, `openai/gpt-5.6-sol`. |
 | `hotkey` | Atalho do popup. Ex.: `ctrl+b`, `ctrl+alt+e`, `alt+f2`. Exige ao menos um modificador. |
-| `quick_hotkey` | Atalho rápido. Ex.: `win+b`. Vazio desliga. |
+| `quick_hotkey` | Atalho rápido. Ex.: `ctrl+s`, `win+b`. Vazio desliga. |
 | `temperature` | Padrão `0.4`. |
 | `max_tokens` | Padrão `2000`. |
 | `signature` | Seu nome/cargo, usado quando o formato pede assinatura. |
@@ -82,8 +85,9 @@ Primeira execução cria `%APPDATA%\better-answer\config.toml`:
 
 Mudança de atalho só vale depois de reiniciar o app. O resto vale na hora.
 
-O atalho aceita modificador + **uma** tecla, que é o que o `RegisterHotKey` do Windows suporta.
-Acorde de duas teclas (`ctrl+x+1`) não existe nesse formato e é recusado no parse.
+O atalho aceita modificador + **uma** tecla. Acorde de duas teclas (`ctrl+x+1`) é recusado no parse.
+Teclas de pontuação usam códigos OEM, que seguem o layout US — num ABNT2 a tecla física pode ser
+outra. Letras, dígitos e teclas nomeadas não têm esse problema.
 
 `BETTER_ANSWER_CONFIG` aponta o app para outro arquivo de config — útil para instalação portátil e
 usado pelos testes e2e.
@@ -147,12 +151,17 @@ versões do egui no mesmo binário não compilam, então só a fonte foi vendori
 
 ## Limitações conhecidas
 
-- Windows apenas (`SendInput`, `RegisterHotKey`, clipboard sequence number).
+- Windows apenas (`SendInput`, `WH_KEYBOARD_LL`, clipboard sequence number).
+- Os atalhos usam um hook global de teclado: toda tecla do sistema passa pelo callback do app. Ele
+  lê apenas o virtual-key e o estado dos modificadores, encaminha tudo adiante e não guarda nem
+  transmite nada — mas é bom saber que a superfície existe.
+- O atalho escolhido é **engolido em todo o sistema** enquanto o app roda. O padrão `ctrl+s` tira o
+  "salvar" de todos os apps; se isso atrapalhar, troque `quick_hotkey` no `config.toml` e reinicie.
 - Apps que não respondem a `Ctrl+C` não entregam seleção — nesses casos o popup abre com o campo
   "original" vazio para você colar/digitar.
 - Colar depende de `Ctrl+V` funcionar na janela de origem.
-- Atalho global registrado por um processo comum não dispara enquanto uma janela **elevada**
-  (rodando como administrador) estiver em foco. É bloqueio de UIPI do Windows, não do app.
+- Atalho de um processo comum não dispara enquanto uma janela **elevada** (rodando como
+  administrador) estiver em foco. É bloqueio de UIPI do Windows, não do app.
 - Fixar no Menu Iniciar é manual (bloqueio da Microsoft, veja *Instalação*).
 - A janela precisa desfazer o `set_visible(true)` que o eframe força depois do primeiro frame; por
   isso ela nasce estacionada fora do monitor. Sem isso sobra um retângulo preto na tela.

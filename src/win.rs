@@ -14,7 +14,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow, SetForegroundWindow};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, SetForegroundWindow, SM_CXSCREEN,
+    SM_CYSCREEN,
+};
 
 const VK_C: VIRTUAL_KEY = VIRTUAL_KEY(0x43);
 const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -63,6 +69,32 @@ pub fn round_corners(handle: isize, border: (u8, u8, u8)) {
             &color as *const _ as *const _,
             std::mem::size_of_val(&color) as u32,
         );
+    }
+}
+
+/// Area util do monitor que contem o ponto, em pixels fisicos: `(esquerda, topo, direita, base)`.
+///
+/// "Util" exclui a barra de tarefas. O egui expoe `monitor_size`, mas ele vem vazio enquanto a
+/// janela esta estacionada fora da tela — que e exatamente o estado de onde o popup e chamado —,
+/// e nao conhece o segundo monitor nem a barra de tarefas.
+pub fn work_area_at(point: (i32, i32)) -> (i32, i32, i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let area = info.rcWork;
+            return (area.left, area.top, area.right, area.bottom);
+        }
+        // Sem informacao do monitor, o principal e um palpite melhor do que numero fixo.
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
     }
 }
 
