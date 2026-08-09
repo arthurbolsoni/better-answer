@@ -2,20 +2,36 @@ use crate::config::Config;
 use crate::llm::{self, Msg};
 use crate::win;
 use eframe::egui;
+use egui::{FontFamily, FontId, TextStyle};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-pub const WINDOW_W: f32 = 580.0;
-pub const WINDOW_H: f32 = 500.0;
+pub const WINDOW_W: f32 = 560.0;
+pub const WINDOW_H: f32 = 430.0;
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(88, 140, 255);
-const BG: egui::Color32 = egui::Color32::from_rgb(24, 26, 32);
-const PANEL: egui::Color32 = egui::Color32::from_rgb(32, 35, 43);
+/// Onde a janela estaciona enquanto esta escondida: fora de qualquer monitor.
+///
+/// Nao da para confiar so no `Visible(false)`. O eframe forca `set_visible(true)` assim que o
+/// primeiro frame e pintado (`epi_integration::post_rendering`), entao a janela sempre aparece
+/// uma vez. Estacionada fora da tela, esse frame forcado nao chega aos olhos de ninguem.
+pub const OFFSCREEN: [f32; 2] = [-32000.0, -32000.0];
+
+const BG: egui::Color32 = egui::Color32::from_rgb(14, 15, 19);
+const PANEL: egui::Color32 = egui::Color32::from_rgb(23, 25, 31);
+const PANEL_HI: egui::Color32 = egui::Color32::from_rgb(33, 36, 45);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(45, 49, 60);
+const TEXT: egui::Color32 = egui::Color32::from_rgb(228, 231, 238);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(124, 131, 147);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(122, 162, 255);
+const DANGER: egui::Color32 = egui::Color32::from_rgb(242, 118, 118);
+
+/// Se o `Close` do menu nao derrubar o loop nesse prazo, o processo sai na marra.
+const QUIT_GRACE: Duration = Duration::from_millis(1500);
 
 enum Status {
     Idle,
@@ -25,7 +41,7 @@ enum Status {
     Error(String),
 }
 
-/// Pedido de exibicao vindo da thread do atalho global.
+/// Pedido vindo da thread do atalho global.
 struct ShowRequest {
     hwnd: isize,
     text: String,
@@ -34,8 +50,19 @@ struct ShowRequest {
 }
 
 enum HotkeyMsg {
+    /// Atalho normal: abre o popup.
     Show(Box<ShowRequest>),
+    /// Atalho rapido: melhora e cola sem abrir janela nenhuma.
+    Quick(Box<ShowRequest>),
     Hide,
+}
+
+/// Trabalho do modo rapido. Nao toca no estado do popup: acumula em silencio e cola no fim.
+struct QuickJob {
+    hwnd: isize,
+    generation: u64,
+    buffer: String,
+    previous_clipboard: Option<String>,
 }
 
 pub struct App {
@@ -48,20 +75,29 @@ pub struct App {
     output: String,
     status: Status,
     generation: u64,
+    quick_generation: u64,
     visible: Arc<AtomicBool>,
+    /// `ui()` so roda quando a janela esta visivel para o SO. Serve de sensor de dessincronia.
+    ui_ran: bool,
+    quitting: Option<Instant>,
     target_hwnd: isize,
     previous_clipboard: Option<String>,
     show_settings: bool,
     show_original: bool,
-    toast: Option<(String, std::time::Instant)>,
+    toast: Option<(String, Instant)>,
+    /// Ultimo resultado do modo rapido, que nao tem janela para reportar sozinho.
+    quick_note: Option<(String, bool)>,
+    quick: Option<QuickJob>,
 
     llm_tx: Sender<(u64, Msg)>,
     llm_rx: Receiver<(u64, Msg)>,
+    quick_tx: Sender<(u64, Msg)>,
+    quick_rx: Receiver<(u64, Msg)>,
     hotkey_rx: Receiver<HotkeyMsg>,
 
     tray_open_id: MenuId,
     tray_quit_id: MenuId,
-    _tray: Option<TrayIcon>,
+    tray: Option<TrayIcon>,
     _hotkeys: Option<GlobalHotKeyManager>,
 }
 
@@ -71,6 +107,7 @@ impl App {
         style(&ctx);
 
         let (llm_tx, llm_rx) = channel();
+        let (quick_tx, quick_rx) = channel();
         let (hotkey_tx, hotkey_rx) = channel();
         let visible = Arc::new(AtomicBool::new(false));
 
@@ -80,15 +117,18 @@ impl App {
         };
 
         // O manager precisa nascer na thread que roda o event loop win32 (a main).
-        let hotkeys = match register_hotkey(&cfg.hotkey) {
-            Ok(manager) => Some(manager),
-            Err(err) => {
-                status = Status::Error(format!("atalho '{}' nao registrou: {err:#}", cfg.hotkey));
-                None
-            }
-        };
+        let registration = register_hotkeys(&cfg);
+        if let Some(err) = registration.error {
+            status = Status::Error(err);
+        }
 
-        spawn_hotkey_listener(ctx.clone(), hotkey_tx, visible.clone());
+        spawn_hotkey_listener(
+            ctx.clone(),
+            hotkey_tx,
+            visible.clone(),
+            registration.open_id,
+            registration.quick_id,
+        );
 
         let (tray, tray_open_id, tray_quit_id) = build_tray(&cfg);
 
@@ -101,24 +141,41 @@ impl App {
             output: String::new(),
             status,
             generation: 0,
+            quick_generation: 0,
             visible,
+            ui_ran: false,
+            quitting: None,
             target_hwnd: 0,
             previous_clipboard: None,
             show_settings: false,
             show_original: false,
             toast: None,
+            quick_note: None,
+            quick: None,
             llm_tx,
             llm_rx,
+            quick_tx,
+            quick_rx,
             hotkey_rx,
             tray_open_id,
             tray_quit_id,
-            _tray: tray,
-            _hotkeys: hotkeys,
+            tray,
+            _hotkeys: registration.manager,
         }
     }
 
     fn is_visible(&self) -> bool {
         self.visible.load(Ordering::SeqCst)
+    }
+
+    /// Esconder de verdade: some da tela E sai da area visivel, porque o eframe reexibe a
+    /// janela sozinho depois de pintar.
+    fn park_offscreen(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+            OFFSCREEN[0],
+            OFFSCREEN[1],
+        )));
     }
 
     fn show_window(&mut self, ctx: &egui::Context, cursor: Option<(i32, i32)>) {
@@ -136,10 +193,7 @@ impl App {
                 egui::pos2(px, py)
             }
             None => match monitor {
-                Some(monitor) => egui::pos2(
-                    (monitor.x - WINDOW_W) / 2.0,
-                    (monitor.y - WINDOW_H) / 2.0,
-                ),
+                Some(monitor) => egui::pos2((monitor.x - WINDOW_W) / 2.0, (monitor.y - WINDOW_H) / 2.0),
                 None => egui::pos2(200.0, 200.0),
             },
         };
@@ -148,6 +202,7 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.visible.store(true, Ordering::SeqCst);
+        self.ui_ran = false;
     }
 
     fn hide_window(&mut self, ctx: &egui::Context, restore_clipboard: bool) {
@@ -157,11 +212,12 @@ impl App {
             }
         }
         self.previous_clipboard = None;
-        // Uma geracao nova invalida o stream em andamento.
+        // Uma geracao nova invalida o stream do popup em andamento (o modo rapido tem a sua).
         self.generation += 1;
         self.show_settings = false;
         self.visible.store(false, Ordering::SeqCst);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.ui_ran = false;
+        self.park_offscreen(ctx);
     }
 
     fn start_generation(&mut self, ctx: &egui::Context) {
@@ -172,6 +228,7 @@ impl App {
         self.generation += 1;
         let generation = self.generation;
         self.output.clear();
+        self.quick_note = None;
         self.status = Status::Loading;
 
         let cfg = self.cfg.clone();
@@ -190,10 +247,67 @@ impl App {
         });
     }
 
+    /// Modo rapido: nenhuma janela abre, nem no erro. O retorno vai para o tooltip da bandeja e
+    /// para o aviso mostrado da proxima vez que o popup abrir.
+    fn start_quick(&mut self, ctx: &egui::Context, req: ShowRequest) {
+        let text = req.text.trim().to_string();
+        if text.is_empty() {
+            restore_clipboard(req.previous_clipboard);
+            self.note_quick("nada selecionado", true);
+            return;
+        }
+
+        self.quick_generation += 1;
+        let generation = self.quick_generation;
+        self.quick = Some(QuickJob {
+            hwnd: req.hwnd,
+            generation,
+            buffer: String::new(),
+            previous_clipboard: req.previous_clipboard,
+        });
+        self.note_quick("melhorando...", false);
+
+        let cfg = self.cfg.clone();
+        let tone = cfg.tone(self.tone_index).clone();
+        let tx = self.quick_tx.clone();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let repaint = {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            };
+            llm::stream_improve(&cfg, &tone, &text, "", generation, &tx, repaint);
+        });
+    }
+
+    fn note_quick(&mut self, message: &str, is_error: bool) {
+        self.quick_note = Some((message.to_string(), is_error));
+        self.sync_tray_tooltip();
+    }
+
+    fn sync_tray_tooltip(&self) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        let quick = if self.cfg.quick_hotkey.trim().is_empty() {
+            "desligado".to_string()
+        } else {
+            self.cfg.quick_hotkey.clone()
+        };
+        let mut tip = format!("better-answer\n{} — popup\n{} — rápido", self.cfg.hotkey, quick);
+        if let Some((message, is_error)) = &self.quick_note {
+            let prefix = if *is_error { "erro" } else { "rápido" };
+            tip.push_str(&format!("\n{prefix}: {message}"));
+        }
+        let _ = tray.set_tooltip(Some(tip));
+    }
+
     fn drain_channels(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.hotkey_rx.try_recv() {
             match msg {
                 HotkeyMsg::Hide => self.hide_window(ctx, true),
+                HotkeyMsg::Quick(req) => self.start_quick(ctx, *req),
                 HotkeyMsg::Show(req) => {
                     self.target_hwnd = req.hwnd;
                     self.previous_clipboard = req.previous_clipboard;
@@ -222,23 +336,67 @@ impl App {
             }
         }
 
+        self.drain_quick();
+
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.tray_quit_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.begin_quit(ctx);
             } else if event.id == self.tray_open_id {
-                self.draft = self.cfg.clone();
-                self.show_settings = true;
-                self.show_window(ctx, None);
+                self.open_settings(ctx);
             }
         }
 
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             if let TrayIconEvent::DoubleClick { .. } = event {
-                self.draft = self.cfg.clone();
-                self.show_settings = true;
-                self.show_window(ctx, None);
+                self.open_settings(ctx);
             }
         }
+    }
+
+    fn drain_quick(&mut self) {
+        while let Ok((generation, msg)) = self.quick_rx.try_recv() {
+            if self.quick.as_ref().map(|job| job.generation) != Some(generation) {
+                continue;
+            }
+            match msg {
+                Msg::Delta(delta) => {
+                    if let Some(job) = self.quick.as_mut() {
+                        job.buffer.push_str(&delta);
+                    }
+                }
+                Msg::Done => {
+                    let Some(job) = self.quick.take() else { continue };
+                    let text = job.buffer.trim().to_string();
+                    if text.is_empty() {
+                        restore_clipboard(job.previous_clipboard);
+                        self.note_quick("resposta vazia", true);
+                    } else {
+                        let hwnd = job.hwnd;
+                        std::thread::spawn(move || {
+                            let _ = win::paste_into(hwnd, &text);
+                        });
+                        self.note_quick("colado", false);
+                    }
+                }
+                Msg::Error(err) => {
+                    let Some(job) = self.quick.take() else { continue };
+                    restore_clipboard(job.previous_clipboard);
+                    self.note_quick(&err, true);
+                }
+            }
+        }
+    }
+
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        self.draft = self.cfg.clone();
+        self.show_settings = true;
+        self.show_window(ctx, None);
+    }
+
+    fn begin_quit(&mut self, ctx: &egui::Context) {
+        self.quitting = Some(Instant::now());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
     }
 
     fn apply_replace(&mut self, ctx: &egui::Context) {
@@ -266,7 +424,7 @@ impl App {
     }
 
     fn toast(&mut self, message: &str) {
-        self.toast = Some((message.to_string(), std::time::Instant::now()));
+        self.toast = Some((message.to_string(), Instant::now()));
     }
 }
 
@@ -278,26 +436,47 @@ impl eframe::App for App {
     /// Roda tambem com a janela escondida — e aqui que o atalho global e atendido.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_channels(ctx);
+
+        // Sair pela bandeja nao pode depender do loop cooperar: se o `Close` nao derrubar o
+        // processo no prazo, encerra na marra.
+        if let Some(since) = self.quitting {
+            if since.elapsed() > QUIT_GRACE {
+                std::process::exit(0);
+            }
+        }
+
+        // `ui()` rodou mas o app se considera escondido: alguem exibiu a janela pelas costas
+        // (o eframe faz isso depois do primeiro frame). Reafirma o estado desejado.
+        if self.ui_ran && !self.is_visible() {
+            self.ui_ran = false;
+            self.park_offscreen(ctx);
+            ctx.request_repaint();
+        }
+
         // Janela oculta ainda precisa acordar para ler os eventos da bandeja.
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_ran = true;
         let ctx = &ui.ctx().clone();
 
-        if !self.is_visible() {
-            return;
-        }
-
         if ctx.input(|i| i.viewport().close_requested()) {
-            // O X da janela so esconde; sair e pela bandeja.
+            // Sem CancelClose quando o pedido veio da bandeja: ai e para fechar mesmo.
+            if self.quitting.is_some() {
+                return;
+            }
+            // O X da janela so esconde.
             self.hide_window(ctx, true);
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return;
         }
 
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        if esc {
+        if !self.is_visible() {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.hide_window(ctx, true);
             return;
         }
@@ -312,14 +491,14 @@ impl eframe::App for App {
 
         let frame = egui::Frame::new()
             .fill(BG)
-            .corner_radius(12.0)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 62, 74)))
-            .inner_margin(egui::Margin::same(14));
+            .corner_radius(14.0)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .inner_margin(egui::Margin::same(12));
 
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             self.header(ui, ctx);
-            ui.add_space(8.0);
             if self.show_settings {
+                ui.add_space(10.0);
                 self.settings_ui(ui, ctx);
             } else {
                 self.main_ui(ui, ctx);
@@ -342,55 +521,155 @@ impl eframe::App for App {
 impl App {
     fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            let title = ui.add(
+            // A marca inteira e a alca de arrasto: a janela nao tem barra de titulo.
+            let brand = ui.add(
                 egui::Label::new(
                     egui::RichText::new("better-answer")
+                        .size(12.5)
                         .strong()
-                        .color(ACCENT)
-                        .size(15.0),
+                        .color(TEXT),
                 )
                 .sense(egui::Sense::drag()),
             );
-            if title.drag_started() {
+            if brand.drag_started() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
+            ui.label(egui::RichText::new(&self.cfg.model).size(11.0).color(MUTED));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").on_hover_text("Esc").clicked() {
+                if icon_button(ui, "✕").on_hover_text("Esc").clicked() {
                     self.hide_window(ctx, true);
                 }
-                let gear = if self.show_settings { "▲" } else { "⚙" };
-                if ui.button(gear).on_hover_text("Configuração").clicked() {
+                if icon_button(ui, "⚙").on_hover_text("Configuração").clicked() {
                     self.show_settings = !self.show_settings;
                     if self.show_settings {
                         self.draft = self.cfg.clone();
                     }
                 }
-                ui.label(
-                    egui::RichText::new(&self.cfg.model)
-                        .small()
-                        .color(egui::Color32::from_gray(130)),
-                );
+                if !self.show_settings {
+                    let glyph = if self.show_original { "◧" } else { "◨" };
+                    if icon_button(ui, glyph)
+                        .on_hover_text("Mostrar/ocultar o texto original")
+                        .clicked()
+                    {
+                        self.show_original = !self.show_original;
+                    }
+                }
             });
         });
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Tons: clique ou Alt+1..9.
+        ui.add_space(10.0);
+
+        if let Some(index) = self.tone_bar(ui, ctx) {
+            self.tone_index = index;
+            self.start_generation(ctx);
+        }
+
+        // Aviso do modo rapido: ele nao tem janela, entao reporta aqui na proxima abertura.
+        if let Some((message, true)) = self.quick_note.as_ref().map(|(m, e)| (m.clone(), *e)) {
+            ui.add_space(8.0);
+            banner(ui, DANGER, &format!("atalho rápido: {message}"));
+        }
+
+        // Sem selecao o campo original vira o caminho principal, entao abre sozinho.
+        let force_original = self.original.trim().is_empty();
+        if self.show_original || force_original {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(PANEL)
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("ORIGINAL").size(9.5).color(MUTED));
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.original)
+                            .frame(egui::Frame::NONE)
+                            .desired_rows(if force_original { 3 } else { 2 })
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Nada selecionado. Cole aqui e aperte Ctrl+R."),
+                    );
+                });
+        }
+
+        ui.add_space(8.0);
+
+        // O resultado domina a janela: e o que a pessoa veio ler.
+        let reserved = 34.0 + 30.0 + 10.0; // instrucao + rodape + respiros
+        let body_height = (ui.available_height() - reserved).max(90.0);
+        egui::Frame::new()
+            .fill(PANEL)
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(body_height)
+                    .stick_to_bottom(matches!(self.status, Status::Loading))
+                    .show(ui, |ui| match &self.status {
+                        Status::NoSelection if self.output.is_empty() => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Selecione um texto em qualquer app e chame o atalho.",
+                                )
+                                .color(MUTED),
+                            );
+                        }
+                        Status::Error(err) => {
+                            ui.label(egui::RichText::new(err).color(DANGER));
+                        }
+                        _ => {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.output)
+                                    .frame(egui::Frame::NONE)
+                                    .desired_rows(8)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(if matches!(self.status, Status::Loading) {
+                                        "gerando..."
+                                    } else {
+                                        ""
+                                    }),
+                            );
+                        }
+                    });
+            });
+
+        ui.add_space(8.0);
+        self.instruction_bar(ui, ctx);
+        ui.add_space(8.0);
+        self.footer(ui, ctx);
+    }
+
+    /// Pills de tom. Devolve o indice pedido, por clique ou por Alt+1..9.
+    fn tone_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<usize> {
         let tones: Vec<String> = self.cfg.tones.iter().map(|t| t.name.clone()).collect();
-        let mut requested_tone: Option<usize> = None;
+        let mut requested = None;
+
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
             for (index, name) in tones.iter().enumerate() {
                 let selected = index == self.tone_index;
-                let label = format!("{}  {}", index + 1, name);
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    requested_tone = Some(index);
+                let (fill, stroke, color) = if selected {
+                    (ACCENT.gamma_multiply(0.20), ACCENT.gamma_multiply(0.55), ACCENT)
+                } else {
+                    (PANEL, BORDER, MUTED)
+                };
+                let pill = ui.add(
+                    egui::Button::new(egui::RichText::new(name).size(11.5).color(color))
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, stroke))
+                        .corner_radius(999.0),
+                );
+                if pill.on_hover_text(format!("Alt+{}", index + 1)).clicked() && !selected {
+                    requested = Some(index);
                 }
             }
         });
 
-        let digit_pressed = ctx.input(|i| {
-            [
+        let digit = ctx.input(|i| {
+            const KEYS: [egui::Key; 9] = [
                 egui::Key::Num1,
                 egui::Key::Num2,
                 egui::Key::Num3,
@@ -400,117 +679,60 @@ impl App {
                 egui::Key::Num7,
                 egui::Key::Num8,
                 egui::Key::Num9,
-            ]
-            .iter()
-            .position(|key| i.modifiers.alt && i.key_pressed(*key))
+            ];
+            KEYS.iter().position(|key| i.modifiers.alt && i.key_pressed(*key))
         });
-        if let Some(index) = digit_pressed {
-            if index < tones.len() {
-                requested_tone = Some(index);
+        if let Some(index) = digit {
+            if index < tones.len() && index != self.tone_index {
+                requested = Some(index);
             }
         }
-        if let Some(index) = requested_tone {
-            self.tone_index = index;
-            self.start_generation(ctx);
-        }
 
-        ui.add_space(6.0);
+        requested
+    }
 
-        egui::CollapsingHeader::new("Texto original")
-            .default_open(false)
-            .open(if self.original.trim().is_empty() {
-                Some(true)
-            } else {
-                None
-            })
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.original)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Nada foi selecionado. Cole ou digite aqui e aperte Ctrl+R."),
-                );
-            });
-
-        ui.add_space(6.0);
-        let instruction = ui.add(
-            egui::TextEdit::singleline(&mut self.instruction)
-                .desired_width(f32::INFINITY)
-                .hint_text("Instrução extra (opcional) — ex.: 'mais curto', 'para o cliente'"),
-        );
-        if instruction.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.start_generation(ctx);
-        }
-
-        ui.add_space(8.0);
-
-        let available = ui.available_height() - 46.0;
+    fn instruction_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Frame::new()
             .fill(PANEL)
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::same(8))
+            .corner_radius(999.0)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(available.max(80.0))
-                    .stick_to_bottom(matches!(self.status, Status::Loading))
-                    .show(ui, |ui| {
-                        match &self.status {
-                            Status::NoSelection if self.output.is_empty() => {
-                                ui.colored_label(
-                                    egui::Color32::from_gray(150),
-                                    "Nenhum texto selecionado. Selecione algo e chame o atalho de novo, \
-                                     ou escreva no campo 'Texto original'.",
-                                );
-                            }
-                            Status::Error(err) => {
-                                ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
-                            }
-                            _ => {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut self.output)
-                                        .frame(egui::Frame::NONE)
-                                        .desired_rows(10)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text(if matches!(self.status, Status::Loading) {
-                                            "gerando..."
-                                        } else {
-                                            ""
-                                        }),
-                                );
-                            }
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("›").size(14.0).color(ACCENT));
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.instruction)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("ajuste e Enter — 'mais curto', 'para o cliente'"),
+                    );
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        self.start_generation(ctx);
+                    }
+                });
             });
+    }
 
-        ui.add_space(8.0);
+    fn footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             match &self.status {
                 Status::Loading => {
-                    ui.add(egui::Spinner::new().size(14.0));
-                    ui.label(egui::RichText::new("gerando").small());
+                    ui.add(egui::Spinner::new().size(12.0));
+                    ui.label(egui::RichText::new("gerando").size(11.0).color(MUTED));
                 }
                 Status::Done => {
                     let words = self.output.split_whitespace().count();
-                    ui.label(
-                        egui::RichText::new(format!("{words} palavras"))
-                            .small()
-                            .color(egui::Color32::from_gray(130)),
-                    );
+                    ui.label(egui::RichText::new(format!("{words} palavras")).size(11.0).color(MUTED));
                 }
                 Status::Error(_) => {
-                    ui.label(
-                        egui::RichText::new("erro")
-                            .small()
-                            .color(egui::Color32::from_rgb(240, 120, 120)),
-                    );
+                    ui.label(egui::RichText::new("erro").size(11.0).color(DANGER));
                 }
                 _ => {}
             }
 
-            if let Some((message, at)) = &self.toast {
+            if let Some((message, at)) = self.toast.clone() {
                 if at.elapsed() < Duration::from_secs(2) {
-                    ui.label(egui::RichText::new(message).small().color(ACCENT));
+                    ui.label(egui::RichText::new(message).size(11.0).color(ACCENT));
                 } else {
                     self.toast = None;
                 }
@@ -519,24 +741,22 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ready = !self.output.trim().is_empty();
                 if ui
-                    .add_enabled(ready, egui::Button::new("Substituir"))
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(egui::RichText::new("Substituir").size(11.5).color(BG))
+                            .fill(ACCENT)
+                            .corner_radius(8.0),
+                    )
                     .on_hover_text("Ctrl+Enter — cola no app de origem")
                     .clicked()
                 {
                     self.apply_replace(ctx);
                 }
-                if ui
-                    .add_enabled(ready, egui::Button::new("Copiar"))
-                    .on_hover_text("Ctrl+Shift+C")
-                    .clicked()
-                {
+                if ghost_button(ui, "Copiar", ready).on_hover_text("Ctrl+Shift+C").clicked() {
                     self.apply_copy(ctx);
+                    self.toast("copiado");
                 }
-                if ui
-                    .button("Refazer")
-                    .on_hover_text("Ctrl+R")
-                    .clicked()
-                {
+                if ghost_button(ui, "Refazer", true).on_hover_text("Ctrl+R").clicked() {
                     self.start_generation(ctx);
                 }
             });
@@ -546,7 +766,7 @@ impl App {
     fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .max_height(ui.available_height() - 40.0)
+            .max_height(ui.available_height() - 42.0)
             .show(ui, |ui| {
                 egui::Grid::new("settings")
                     .num_columns(2)
@@ -559,11 +779,19 @@ impl App {
                         );
                         ui.end_row();
 
-                        ui.label("Atalho");
+                        ui.label("Atalho (popup)");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.draft.hotkey)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("ctrl+alt+e"),
+                                .hint_text("ctrl+b"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Atalho rápido");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.quick_hotkey)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("alt+b — vazio desliga"),
                         );
                         ui.end_row();
 
@@ -593,8 +821,9 @@ impl App {
                         ui.end_row();
                     });
 
-                ui.add_space(6.0);
-                ui.label("Contexto fixo (some em todos os tons)");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("CONTEXTO FIXO").size(9.5).color(MUTED));
+                ui.add_space(2.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.draft.extra_context)
                         .desired_rows(4)
@@ -602,25 +831,34 @@ impl App {
                         .hint_text("ex.: escrevo para o time de suporte da WMC; evite jargão técnico"),
                 );
 
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 if let Ok(path) = Config::path() {
                     ui.label(
                         egui::RichText::new(format!("Tons editáveis em {}", path.display()))
-                            .small()
-                            .color(egui::Color32::from_gray(120)),
+                            .size(10.5)
+                            .color(MUTED),
                     );
                 }
             });
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Salvar").clicked() {
-                let hotkey_changed = self.draft.hotkey != self.cfg.hotkey;
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("Salvar").size(11.5).color(BG))
+                        .fill(ACCENT)
+                        .corner_radius(8.0),
+                )
+                .clicked()
+            {
+                let hotkeys_changed = self.draft.hotkey != self.cfg.hotkey
+                    || self.draft.quick_hotkey != self.cfg.quick_hotkey;
                 self.cfg = self.draft.clone();
                 match self.cfg.save() {
                     Ok(()) => {
-                        if hotkey_changed {
-                            self.toast("salvo — reinicie para o novo atalho valer");
+                        self.sync_tray_tooltip();
+                        if hotkeys_changed {
+                            self.toast("salvo — reinicie para os novos atalhos valerem");
                         } else {
                             self.toast("salvo");
                         }
@@ -629,13 +867,13 @@ impl App {
                     Err(err) => self.status = Status::Error(format!("{err:#}")),
                 }
             }
-            if ui.button("Cancelar").clicked() {
+            if ghost_button(ui, "Cancelar", true).clicked() {
                 self.draft = self.cfg.clone();
                 self.show_settings = false;
             }
-            if let Some((message, at)) = &self.toast {
+            if let Some((message, at)) = self.toast.clone() {
                 if at.elapsed() < Duration::from_secs(3) {
-                    ui.label(egui::RichText::new(message).small().color(ACCENT));
+                    ui.label(egui::RichText::new(message).size(11.0).color(ACCENT));
                 }
             }
             let _ = ctx;
@@ -643,17 +881,110 @@ impl App {
     }
 }
 
-fn register_hotkey(spec: &str) -> anyhow::Result<GlobalHotKeyManager> {
-    let hotkey = crate::hotkey::parse(spec)?;
-    let manager = GlobalHotKeyManager::new()?;
-    manager.register(hotkey)?;
-    Ok(manager)
+fn restore_clipboard(previous: Option<String>) {
+    if let Some(previous) = previous {
+        let _ = win::set_clipboard_text(&previous);
+    }
+}
+
+fn icon_button(ui: &mut egui::Ui, glyph: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(glyph).size(12.0).color(MUTED))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(6.0)
+            .min_size(egui::vec2(22.0, 20.0)),
+    )
+}
+
+fn ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(11.5).color(TEXT))
+            .fill(PANEL_HI)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(8.0),
+    )
+}
+
+fn banner(ui: &mut egui::Ui, color: egui::Color32, message: &str) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.14))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(message).size(11.0).color(color));
+        });
+}
+
+struct Registration {
+    manager: Option<GlobalHotKeyManager>,
+    open_id: u32,
+    quick_id: Option<u32>,
+    error: Option<String>,
+}
+
+fn register_hotkeys(cfg: &Config) -> Registration {
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(manager) => manager,
+        Err(err) => {
+            return Registration {
+                manager: None,
+                open_id: 0,
+                quick_id: None,
+                error: Some(format!("atalhos globais indisponiveis: {err}")),
+            }
+        }
+    };
+
+    let mut errors = Vec::new();
+
+    let open_id = match crate::hotkey::parse(&cfg.hotkey).and_then(|hk| {
+        manager.register(hk)?;
+        Ok(hk.id())
+    }) {
+        Ok(id) => id,
+        Err(err) => {
+            errors.push(format!("atalho '{}' nao registrou: {err:#}", cfg.hotkey));
+            0
+        }
+    };
+
+    let quick_spec = cfg.quick_hotkey.trim();
+    let quick_id = if quick_spec.is_empty() {
+        None
+    } else {
+        match crate::hotkey::parse(quick_spec).and_then(|hk| {
+            manager.register(hk)?;
+            Ok(hk.id())
+        }) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                errors.push(format!("atalho rápido '{quick_spec}' nao registrou: {err:#}"));
+                None
+            }
+        }
+    };
+
+    Registration {
+        manager: Some(manager),
+        open_id,
+        quick_id,
+        error: if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join(" · "))
+        },
+    }
 }
 
 fn spawn_hotkey_listener(
     ctx: egui::Context,
     tx: Sender<HotkeyMsg>,
     visible: Arc<AtomicBool>,
+    open_id: u32,
+    quick_id: Option<u32>,
 ) {
     std::thread::spawn(move || {
         let receiver = GlobalHotKeyEvent::receiver();
@@ -661,19 +992,31 @@ fn spawn_hotkey_listener(
             if event.state != HotKeyState::Pressed {
                 continue;
             }
-            // Com o popup aberto, o atalho fecha em vez de copiar a selecao da propria janela.
-            let msg = if visible.load(Ordering::SeqCst) {
+
+            let is_quick = Some(event.id) == quick_id;
+            if !is_quick && event.id != open_id {
+                continue;
+            }
+
+            // Com o popup aberto, o atalho normal fecha em vez de copiar a propria janela.
+            let msg = if !is_quick && visible.load(Ordering::SeqCst) {
                 HotkeyMsg::Hide
             } else {
                 let hwnd = win::foreground_window();
                 let capture = win::capture_selection();
-                HotkeyMsg::Show(Box::new(ShowRequest {
+                let request = Box::new(ShowRequest {
                     hwnd,
                     text: capture.text,
                     previous_clipboard: capture.previous_clipboard,
                     cursor: win::cursor_pos(),
-                }))
+                });
+                if is_quick {
+                    HotkeyMsg::Quick(request)
+                } else {
+                    HotkeyMsg::Show(request)
+                }
             };
+
             if tx.send(msg).is_err() {
                 break;
             }
@@ -700,9 +1043,17 @@ fn build_tray(cfg: &Config) -> (Option<TrayIcon>, MenuId, MenuId) {
         return (None, open_id, quit_id);
     }
 
+    let quick = if cfg.quick_hotkey.trim().is_empty() {
+        "desligado".to_string()
+    } else {
+        cfg.quick_hotkey.clone()
+    };
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(format!("better-answer — {}", cfg.hotkey))
+        .with_tooltip(format!(
+            "better-answer\n{} — popup\n{} — rápido",
+            cfg.hotkey, quick
+        ))
         .with_icon(tray_icon_image())
         .build()
         .ok();
@@ -764,12 +1115,25 @@ fn style(ctx: &egui::Context) {
     visuals.panel_fill = BG;
     visuals.window_fill = BG;
     visuals.extreme_bg_color = PANEL;
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.45);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.override_text_color = Some(TEXT);
+    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
+    visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.widgets.inactive.weak_bg_fill = PANEL_HI;
+    visuals.widgets.hovered.weak_bg_fill = BORDER;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
+    visuals.widgets.active.weak_bg_fill = BORDER;
     ctx.set_visuals(visuals);
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(12.0, FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(15.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
+        ]
+        .into();
     });
 }

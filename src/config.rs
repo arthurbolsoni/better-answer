@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+/// Aponta o config para outro arquivo. Usado pelos testes e2e e por instalacao portatil.
+pub const CONFIG_PATH_ENV: &str = "BETTER_ANSWER_CONFIG";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tone {
@@ -17,8 +19,10 @@ pub struct Config {
     /// Chave da OpenRouter. Deixe vazio para usar a variavel de ambiente OPENROUTER_API_KEY.
     pub api_key: String,
     pub model: String,
-    /// Ex.: "ctrl+alt+e", "ctrl+shift+space", "alt+f1".
+    /// Abre o popup. Ex.: "ctrl+b", "ctrl+alt+e", "ctrl+shift+space".
     pub hotkey: String,
+    /// Melhora com o tom padrao e cola direto, sem abrir janela. Vazio desliga.
+    pub quick_hotkey: String,
     pub temperature: f32,
     pub max_tokens: u32,
     /// Assinatura/nome usado quando o texto virar e-mail.
@@ -34,7 +38,8 @@ impl Default for Config {
         Self {
             api_key: String::new(),
             model: "anthropic/claude-sonnet-5".to_string(),
-            hotkey: "ctrl+alt+e".to_string(),
+            hotkey: "ctrl+b".to_string(),
+            quick_hotkey: "alt+b".to_string(),
             temperature: 0.4,
             max_tokens: 2000,
             signature: String::new(),
@@ -46,6 +51,12 @@ impl Default for Config {
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
+        if let Ok(custom) = std::env::var(CONFIG_PATH_ENV) {
+            let custom = custom.trim();
+            if !custom.is_empty() {
+                return Ok(PathBuf::from(custom));
+            }
+        }
         let dir = dirs::config_dir().context("nao consegui achar o diretorio de config do usuario")?;
         Ok(dir.join("better-answer").join("config.toml"))
     }
@@ -91,8 +102,55 @@ impl Config {
         }
     }
 
+    /// Nunca entra em panico: um config com `tones = []` cai no tom embutido.
     pub fn tone(&self, index: usize) -> &Tone {
-        self.tones.get(index).unwrap_or(&self.tones[0])
+        static FALLBACK: std::sync::OnceLock<Tone> = std::sync::OnceLock::new();
+        self.tones
+            .get(index)
+            .or_else(|| self.tones.first())
+            .unwrap_or_else(|| FALLBACK.get_or_init(|| default_tones().swap_remove(0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_ship_both_hotkeys() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkey, "ctrl+b");
+        assert_eq!(cfg.quick_hotkey, "alt+b");
+        assert!(crate::hotkey::parse(&cfg.hotkey).is_ok());
+        assert!(crate::hotkey::parse(&cfg.quick_hotkey).is_ok());
+    }
+
+    /// Config antigo (sem `quick_hotkey`) precisa continuar carregando.
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        let cfg: Config = toml::from_str(r#"model = "algum/modelo""#).unwrap();
+        assert_eq!(cfg.model, "algum/modelo");
+        assert_eq!(cfg.quick_hotkey, "alt+b");
+        assert!(!cfg.tones.is_empty());
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.quick_hotkey = "ctrl+shift+j".to_string();
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(back.quick_hotkey, "ctrl+shift+j");
+        assert_eq!(back.tones.len(), cfg.tones.len());
+    }
+
+    /// Um config editado a mao com `tones = []` nao pode derrubar o app.
+    #[test]
+    fn tone_survives_empty_list() {
+        let cfg: Config = toml::from_str("tones = []").unwrap();
+        assert!(cfg.tones.is_empty());
+        assert!(!cfg.tone(0).prompt.is_empty());
+        assert!(!cfg.tone(7).prompt.is_empty());
     }
 }
 

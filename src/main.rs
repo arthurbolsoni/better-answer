@@ -41,10 +41,14 @@ fn main() -> eframe::Result<()> {
         None => {}
     }
 
+    // `with_visible(false)` nao basta: o eframe forca `set_visible(true)` depois de pintar o
+    // primeiro frame (epi_integration::post_rendering). Nascer fora da tela garante que esse
+    // frame forcado nao apareca; o App reafirma `Visible(false)` e so entao posiciona.
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("better-answer")
         .with_inner_size([app::WINDOW_W, app::WINDOW_H])
         .with_min_inner_size([420.0, 320.0])
+        .with_position(app::OFFSCREEN)
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()

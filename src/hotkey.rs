@@ -124,8 +124,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_shipped_defaults() {
+        let open = parse("ctrl+b").unwrap();
+        assert_eq!(open.mods, Modifiers::CONTROL);
+        assert_eq!(open.key, Code::KeyB);
+
+        let quick = parse("alt+b").unwrap();
+        assert_eq!(quick.mods, Modifiers::ALT);
+        assert_eq!(quick.key, Code::KeyB);
+
+        // Os dois atalhos precisam ser distinguiveis: o app roteia pelo id.
+        assert_ne!(open.id(), quick.id());
+    }
+
+    #[test]
     fn rejects_missing_modifier() {
         assert!(parse("e").is_err());
+    }
+
+    /// O Windows registra modificador + UMA tecla. Acorde tipo "ctrl+x depois 1" nao existe
+    /// nesse formato, e falhar aqui e melhor do que registrar algo diferente do que foi escrito.
+    #[test]
+    fn rejects_chord_with_two_main_keys() {
+        let err = parse("ctrl+x+1").unwrap_err().to_string();
+        assert!(err.contains("mais de uma tecla principal"), "{err}");
     }
 
     #[test]
