@@ -10,12 +10,13 @@ dirs = "6.0.0"
 eframe = "0.36.1"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
+raw-window-handle = "0.6.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.4"
 tray-icon = "0.24.2"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Console"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Console"] }
 
 [profile.release]
 lto = true

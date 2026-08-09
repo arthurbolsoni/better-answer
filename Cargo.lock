@@ -485,6 +485,7 @@ dependencies = [
  "eframe",
  "egui",
  "global-hotkey",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",

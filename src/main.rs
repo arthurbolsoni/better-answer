@@ -50,7 +50,9 @@ fn main() -> eframe::Result<()> {
         .with_min_inner_size([420.0, 320.0])
         .with_position(app::OFFSCREEN)
         .with_decorations(false)
-        .with_transparent(true)
+        // Sem transparencia de proposito: o alpha nao chega ao compositor por este caminho, entao
+        // pedir janela transparente so rendia um retangulo preto. Quem arredonda e o DWM.
+        .with_transparent(false)
         .with_always_on_top()
         .with_taskbar(false)
         .with_visible(false);

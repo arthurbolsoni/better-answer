@@ -5,11 +5,14 @@
 
 use anyhow::{anyhow, Result};
 use std::time::Duration;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{COLORREF, HWND, POINT};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_F13, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow, SetForegroundWindow};
 
@@ -27,6 +30,37 @@ pub fn focus_window(handle: isize) {
     }
     unsafe {
         let _ = SetForegroundWindow(HWND(handle as *mut _));
+    }
+}
+
+/// Arredonda a janela pelo DWM, com uma borda de 1px desenhada pelo proprio Windows.
+///
+/// Nao da para arredondar pintando um card com `corner_radius` por cima: isso depende da janela
+/// ser mesmo transparente, e o alpha do surface wgpu nao chega ao compositor nessa maquina — o que
+/// aparece e um retangulo opaco quadrado com o card arredondado dentro. Pedir para o DWM recortar
+/// a janela resolve no nivel certo, e ainda traz a sombra do sistema.
+pub fn round_corners(handle: isize, border: (u8, u8, u8)) {
+    if handle == 0 {
+        return;
+    }
+    let hwnd = HWND(handle as *mut _);
+    let preference = DWMWCP_ROUND;
+    let (r, g, b) = border;
+    // COLORREF e 0x00BBGGRR, ao contrario do RGB que o resto do app usa.
+    let color = COLORREF((b as u32) << 16 | (g as u32) << 8 | r as u32);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const _,
+            std::mem::size_of_val(&preference) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const _ as *const _,
+            std::mem::size_of_val(&color) as u32,
+        );
     }
 }
 
@@ -69,6 +103,18 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
 /// O atalho global e disparado com os modificadores ainda pressionados fisicamente.
 /// Sem soltar antes, o Ctrl+C sintetico vira Ctrl+Alt+C na janela alvo.
 fn release_modifiers() {
+    // Com um atalho de Alt (o modo rapido usa alt+b), a janela em foco ja recebeu o
+    // WM_SYSKEYDOWN do Alt, e a tecla principal foi engolida pelo RegisterHotKey. Soltar o Alt
+    // assim vira um toque isolado, e um Alt isolado manda o DefWindowProc abrir a barra de menu:
+    // a janela "responde" ao atalho e o Ctrl+C seguinte cai dentro do menu, sem copiar nada.
+    // Uma tecla inerte no meio tira do Alt a condicao de toque isolado.
+    if is_down(VK_MENU) {
+        send(&[
+            key_event(VK_F13, KEYBD_EVENT_FLAGS(0)),
+            key_event(VK_F13, KEYEVENTF_KEYUP),
+        ]);
+    }
+
     let mut up = Vec::new();
     for vk in [VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN, VK_CONTROL] {
         if is_down(vk) {

@@ -105,6 +105,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Config, cfg_error: Option<String>) -> Self {
         let ctx = cc.egui_ctx.clone();
         style(&ctx);
+        win::round_corners(window_handle(cc), (BORDER.r(), BORDER.g(), BORDER.b()));
 
         let (llm_tx, llm_rx) = channel();
         let (quick_tx, quick_rx) = channel();
@@ -430,7 +431,8 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
+        let [r, g, b, _] = BG.to_normalized_gamma_f32();
+        [r, g, b, 1.0]
     }
 
     /// Roda tambem com a janela escondida — e aqui que o atalho global e atendido.
@@ -489,10 +491,10 @@ impl eframe::App for App {
             )
         });
 
+        // Sem canto nem contorno aqui: quem recorta e desenha a borda da janela e o DWM. Um card
+        // arredondado por cima de uma janela opaca so deixaria as quinas quadradas aparecendo.
         let frame = egui::Frame::new()
             .fill(BG)
-            .corner_radius(14.0)
-            .stroke(egui::Stroke::new(1.0, BORDER))
             .inner_margin(egui::Margin::same(12));
 
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
@@ -537,7 +539,7 @@ impl App {
             ui.label(egui::RichText::new(&self.cfg.model).size(11.0).color(MUTED));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, "✕").on_hover_text("Esc").clicked() {
+                if icon_button(ui, "×").on_hover_text("Esc").clicked() {
                     self.hide_window(ctx, true);
                 }
                 if icon_button(ui, "⚙").on_hover_text("Configuração").clicked() {
@@ -547,9 +549,17 @@ impl App {
                     }
                 }
                 if !self.show_settings {
-                    let glyph = if self.show_original { "◧" } else { "◨" };
-                    if icon_button(ui, glyph)
-                        .on_hover_text("Mostrar/ocultar o texto original")
+                    let color = if self.show_original { ACCENT } else { MUTED };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("original").size(10.5).color(color),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6.0),
+                        )
+                        .on_hover_text("Mostrar/ocultar o texto capturado")
                         .clicked()
                     {
                         self.show_original = !self.show_original;
@@ -881,15 +891,31 @@ impl App {
     }
 }
 
+/// HWND da janela raiz, ou 0 se o backend nao expuser (nenhum caminho depende disso para andar).
+fn window_handle(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    match cc.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(win32)) => win32.hwnd.get(),
+        _ => 0,
+    }
+}
+
 fn restore_clipboard(previous: Option<String>) {
     if let Some(previous) = previous {
         let _ = win::set_clipboard_text(&previous);
     }
 }
 
+/// Botao de icone do cabecalho.
+///
+/// O glifo tem que existir nas fontes que o egui embute — a familia proporcional e
+/// `[Ubuntu-Light, NotoEmoji-Regular, emoji-icon-font]`. Simbolo fora dessas vira quadrado vazio:
+/// `✕` (U+2715) e `◧`/`◨` (U+25E7/8), por exemplo, nao estao em nenhuma delas. Dai `×` (U+00D7,
+/// Ubuntu-Light) e `⚙` (U+2699, emoji-icon-font).
 fn icon_button(ui: &mut egui::Ui, glyph: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(glyph).size(12.0).color(MUTED))
+        egui::Button::new(egui::RichText::new(glyph).size(15.0).color(MUTED))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
             .corner_radius(6.0)
