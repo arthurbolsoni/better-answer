@@ -1,0 +1,23 @@
+[package]
+name = "better-answer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.6.1"
+dirs = "6.0.0"
+eframe = "0.36.1"
+egui = "0.36.1"
+global-hotkey = "0.8.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+tray-icon = "0.24.2"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Console"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
