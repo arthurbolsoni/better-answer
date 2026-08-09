@@ -3,7 +3,6 @@ use crate::llm::{self, Msg};
 use crate::win;
 use eframe::egui;
 use egui::{FontFamily, FontId, TextStyle};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -119,7 +118,6 @@ pub struct App {
     tray_open_id: MenuId,
     tray_quit_id: MenuId,
     tray: Option<TrayIcon>,
-    _hotkeys: Option<GlobalHotKeyManager>,
 }
 
 impl App {
@@ -144,13 +142,9 @@ impl App {
             status = Status::Error(err);
         }
 
-        spawn_hotkey_listener(
-            ctx.clone(),
-            hotkey_tx,
-            visible.clone(),
-            registration.open_id,
-            registration.quick_id,
-        );
+        if let Some(hotkey_rx) = registration.hotkey_rx {
+            spawn_hotkey_listener(ctx.clone(), hotkey_tx, visible.clone(), hotkey_rx);
+        }
 
         let (tray, tray_open_id, tray_quit_id) = build_tray(&cfg);
 
@@ -185,7 +179,6 @@ impl App {
             tray_open_id,
             tray_quit_id,
             tray,
-            _hotkeys: registration.manager,
         }
     }
 
@@ -1058,59 +1051,49 @@ fn banner(ui: &mut egui::Ui, color: egui::Color32, message: &str) {
         });
 }
 
+/// Ids que o hook devolve. Fixos, so precisam ser distintos entre si.
+const OPEN_ID: u32 = 1;
+const QUICK_ID: u32 = 2;
+
 struct Registration {
-    manager: Option<GlobalHotKeyManager>,
-    open_id: u32,
-    quick_id: Option<u32>,
+    hotkey_rx: Option<Receiver<u32>>,
     error: Option<String>,
 }
 
 fn register_hotkeys(cfg: &Config) -> Registration {
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => manager,
-        Err(err) => {
-            return Registration {
-                manager: None,
-                open_id: 0,
-                quick_id: None,
-                error: Some(format!("atalhos globais indisponiveis: {err}")),
-            }
-        }
-    };
-
+    let mut bindings = Vec::new();
     let mut errors = Vec::new();
 
-    let open_id = match crate::hotkey::parse(&cfg.hotkey).and_then(|hk| {
-        manager.register(hk)?;
-        Ok(hk.id())
-    }) {
-        Ok(id) => id,
-        Err(err) => {
-            errors.push(format!("atalho '{}' nao registrou: {err:#}", cfg.hotkey));
-            0
-        }
-    };
+    match crate::hotkey::parse(&cfg.hotkey) {
+        Ok(shortcut) => bindings.push(crate::hook::Binding {
+            id: OPEN_ID,
+            shortcut,
+        }),
+        Err(err) => errors.push(format!("atalho '{}' invalido: {err:#}", cfg.hotkey)),
+    }
 
     let quick_spec = cfg.quick_hotkey.trim();
-    let quick_id = if quick_spec.is_empty() {
-        None
-    } else {
-        match crate::hotkey::parse(quick_spec).and_then(|hk| {
-            manager.register(hk)?;
-            Ok(hk.id())
-        }) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                errors.push(format!("atalho rápido '{quick_spec}' nao registrou: {err:#}"));
-                None
-            }
+    if !quick_spec.is_empty() {
+        match crate::hotkey::parse(quick_spec) {
+            Ok(shortcut) => bindings.push(crate::hook::Binding {
+                id: QUICK_ID,
+                shortcut,
+            }),
+            Err(err) => errors.push(format!("atalho rápido '{quick_spec}' invalido: {err:#}")),
+        }
+    }
+
+    let (tx, rx) = channel();
+    let hotkey_rx = match crate::hook::spawn(bindings, tx) {
+        Ok(()) => Some(rx),
+        Err(err) => {
+            errors.push(format!("{err:#}"));
+            None
         }
     };
 
     Registration {
-        manager: Some(manager),
-        open_id,
-        quick_id,
+        hotkey_rx,
         error: if errors.is_empty() {
             None
         } else {
@@ -1119,29 +1102,24 @@ fn register_hotkeys(cfg: &Config) -> Registration {
     }
 }
 
+/// Traduz o aviso do hook em trabalho de verdade. Precisa ser uma thread separada da do hook:
+/// capturar a selecao dorme ate 600ms esperando o app de origem responder ao Ctrl+C.
 fn spawn_hotkey_listener(
     ctx: egui::Context,
     tx: Sender<HotkeyMsg>,
     visible: Arc<AtomicBool>,
-    open_id: u32,
-    quick_id: Option<u32>,
+    hotkey_rx: Receiver<u32>,
 ) {
     std::thread::spawn(move || {
-        let receiver = GlobalHotKeyEvent::receiver();
-        while let Ok(event) = receiver.recv() {
-            if event.state != HotKeyState::Pressed {
-                continue;
-            }
-
-            let is_quick = Some(event.id) == quick_id;
-            if !is_quick && event.id != open_id {
-                continue;
-            }
+        while let Ok(id) = hotkey_rx.recv() {
+            let is_quick = id == QUICK_ID;
 
             // Com o popup aberto, o atalho normal fecha em vez de copiar a propria janela.
             let msg = if !is_quick && visible.load(Ordering::SeqCst) {
                 HotkeyMsg::Hide
             } else {
+                // O alvo e lido antes de qualquer tecla sintetica: se algo roubar o foco no meio,
+                // a colagem ainda volta para a janela certa.
                 let hwnd = win::foreground_window();
                 let capture = win::capture_selection();
                 let request = Box::new(ShowRequest {

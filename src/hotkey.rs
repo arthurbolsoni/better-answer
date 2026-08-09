@@ -1,10 +1,27 @@
-use anyhow::{anyhow, Result};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+//! Parse de atalho no formato "ctrl+alt+e", "win+b", "ctrl+shift+space".
+//!
+//! O resultado sai em virtual-key do Windows porque quem escuta e um hook WH_KEYBOARD_LL
+//! (veja [`crate::hook`]), nao o `RegisterHotKey`. O `RegisterHotKey` nao serve aqui: combos
+//! proprios do shell, como Win+B, sao tratados por ele antes de chegarem ao app, mesmo com o
+//! registro bem-sucedido.
 
-/// Parseia "ctrl+alt+e", "ctrl+shift+space", "alt+f2" em um HotKey.
-pub fn parse(spec: &str) -> Result<HotKey> {
-    let mut mods = Modifiers::empty();
-    let mut code: Option<Code> = None;
+use anyhow::{anyhow, Result};
+
+pub const CTRL: u8 = 1 << 0;
+pub const ALT: u8 = 1 << 1;
+pub const SHIFT: u8 = 1 << 2;
+pub const WIN: u8 = 1 << 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shortcut {
+    /// Combinacao exata de modificadores: ctrl+b nao dispara com ctrl+shift+b pressionado.
+    pub mods: u8,
+    pub vk: u16,
+}
+
+pub fn parse(spec: &str) -> Result<Shortcut> {
+    let mut mods = 0u8;
+    let mut vk: Option<u16> = None;
 
     for raw in spec.split('+') {
         let part = raw.trim().to_ascii_lowercase();
@@ -12,104 +29,79 @@ pub fn parse(spec: &str) -> Result<HotKey> {
             continue;
         }
         match part.as_str() {
-            "ctrl" | "control" => mods |= Modifiers::CONTROL,
-            "alt" | "option" => mods |= Modifiers::ALT,
-            "shift" => mods |= Modifiers::SHIFT,
-            "win" | "super" | "meta" | "cmd" => mods |= Modifiers::META,
+            "ctrl" | "control" => mods |= CTRL,
+            "alt" | "option" => mods |= ALT,
+            "shift" => mods |= SHIFT,
+            "win" | "super" | "meta" | "cmd" => mods |= WIN,
             other => {
-                if code.is_some() {
+                if vk.is_some() {
                     return Err(anyhow!("hotkey '{spec}' tem mais de uma tecla principal"));
                 }
-                code = Some(parse_code(other).ok_or_else(|| anyhow!("tecla '{other}' desconhecida em '{spec}'"))?);
+                vk = Some(
+                    parse_vk(other)
+                        .ok_or_else(|| anyhow!("tecla '{other}' desconhecida em '{spec}'"))?,
+                );
             }
         }
     }
 
-    let code = code.ok_or_else(|| anyhow!("hotkey '{spec}' nao tem tecla principal"))?;
-    if mods.is_empty() {
+    let vk = vk.ok_or_else(|| anyhow!("hotkey '{spec}' nao tem tecla principal"))?;
+    if mods == 0 {
         return Err(anyhow!("hotkey '{spec}' precisa de pelo menos um modificador"));
     }
-    Ok(HotKey::new(Some(mods), code))
+    Ok(Shortcut { mods, vk })
 }
 
-fn parse_code(key: &str) -> Option<Code> {
-    let code = match key {
-        "a" => Code::KeyA,
-        "b" => Code::KeyB,
-        "c" => Code::KeyC,
-        "d" => Code::KeyD,
-        "e" => Code::KeyE,
-        "f" => Code::KeyF,
-        "g" => Code::KeyG,
-        "h" => Code::KeyH,
-        "i" => Code::KeyI,
-        "j" => Code::KeyJ,
-        "k" => Code::KeyK,
-        "l" => Code::KeyL,
-        "m" => Code::KeyM,
-        "n" => Code::KeyN,
-        "o" => Code::KeyO,
-        "p" => Code::KeyP,
-        "q" => Code::KeyQ,
-        "r" => Code::KeyR,
-        "s" => Code::KeyS,
-        "t" => Code::KeyT,
-        "u" => Code::KeyU,
-        "v" => Code::KeyV,
-        "w" => Code::KeyW,
-        "x" => Code::KeyX,
-        "y" => Code::KeyY,
-        "z" => Code::KeyZ,
-        "0" => Code::Digit0,
-        "1" => Code::Digit1,
-        "2" => Code::Digit2,
-        "3" => Code::Digit3,
-        "4" => Code::Digit4,
-        "5" => Code::Digit5,
-        "6" => Code::Digit6,
-        "7" => Code::Digit7,
-        "8" => Code::Digit8,
-        "9" => Code::Digit9,
-        "f1" => Code::F1,
-        "f2" => Code::F2,
-        "f3" => Code::F3,
-        "f4" => Code::F4,
-        "f5" => Code::F5,
-        "f6" => Code::F6,
-        "f7" => Code::F7,
-        "f8" => Code::F8,
-        "f9" => Code::F9,
-        "f10" => Code::F10,
-        "f11" => Code::F11,
-        "f12" => Code::F12,
-        "space" => Code::Space,
-        "enter" | "return" => Code::Enter,
-        "tab" => Code::Tab,
-        "backspace" => Code::Backspace,
-        "insert" => Code::Insert,
-        "delete" | "del" => Code::Delete,
-        "home" => Code::Home,
-        "end" => Code::End,
-        "pageup" => Code::PageUp,
-        "pagedown" => Code::PageDown,
-        "up" => Code::ArrowUp,
-        "down" => Code::ArrowDown,
-        "left" => Code::ArrowLeft,
-        "right" => Code::ArrowRight,
-        "," => Code::Comma,
-        "." => Code::Period,
-        ";" => Code::Semicolon,
-        "'" => Code::Quote,
-        "[" => Code::BracketLeft,
-        "]" => Code::BracketRight,
-        "\\" => Code::Backslash,
-        "/" => Code::Slash,
-        "-" => Code::Minus,
-        "=" => Code::Equal,
-        "`" => Code::Backquote,
+/// As teclas de pontuacao usam os codigos OEM, que seguem o layout US. Num teclado ABNT2 a tecla
+/// fisica pode ser outra; letras, digitos e teclas nomeadas nao tem esse problema.
+fn parse_vk(key: &str) -> Option<u16> {
+    if key.len() == 1 {
+        let ch = key.chars().next()?;
+        if ch.is_ascii_lowercase() {
+            return Some(0x41 + (ch as u16 - 'a' as u16));
+        }
+        if ch.is_ascii_digit() {
+            return Some(0x30 + (ch as u16 - '0' as u16));
+        }
+    }
+
+    if let Some(number) = key.strip_prefix('f') {
+        if let Ok(index) = number.parse::<u16>() {
+            if (1..=24).contains(&index) {
+                return Some(0x70 + index - 1);
+            }
+        }
+    }
+
+    let vk = match key {
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "tab" => 0x09,
+        "backspace" => 0x08,
+        "insert" => 0x2D,
+        "delete" | "del" => 0x2E,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "," => 0xBC,
+        "." => 0xBE,
+        ";" => 0xBA,
+        "'" => 0xDE,
+        "[" => 0xDB,
+        "]" => 0xDD,
+        "\\" => 0xDC,
+        "/" => 0xBF,
+        "-" => 0xBD,
+        "=" => 0xBB,
+        "`" => 0xC0,
         _ => return None,
     };
-    Some(code)
+    Some(vk)
 }
 
 #[cfg(test)]
@@ -119,28 +111,50 @@ mod tests {
     #[test]
     fn parses_ctrl_alt_letter() {
         let hk = parse("ctrl+alt+e").unwrap();
-        assert_eq!(hk.mods, Modifiers::CONTROL | Modifiers::ALT);
-        assert_eq!(hk.key, Code::KeyE);
+        assert_eq!(hk.mods, CTRL | ALT);
+        assert_eq!(hk.vk, 0x45);
     }
 
     #[test]
     fn parses_the_shipped_defaults() {
         let open = parse("ctrl+b").unwrap();
-        assert_eq!(open.mods, Modifiers::CONTROL);
-        assert_eq!(open.key, Code::KeyB);
+        assert_eq!(open.mods, CTRL);
+        assert_eq!(open.vk, 0x42);
 
-        // `HotKey::new` troca META por SUPER, e o backend win32 manda SUPER como MOD_WIN.
         let quick = parse("win+b").unwrap();
-        assert_eq!(quick.mods, Modifiers::SUPER);
-        assert_eq!(quick.key, Code::KeyB);
+        assert_eq!(quick.mods, WIN);
+        assert_eq!(quick.vk, 0x42);
 
-        // Os dois atalhos precisam ser distinguiveis: o app roteia pelo id.
-        assert_ne!(open.id(), quick.id());
+        // O roteamento e por atalho: os dois precisam ser distinguiveis.
+        assert_ne!(open, quick);
+    }
+
+    /// Combinacao exata: quem pede ctrl+b nao quer disparar em ctrl+shift+b.
+    #[test]
+    fn modifiers_are_exact() {
+        assert_ne!(parse("ctrl+b").unwrap(), parse("ctrl+shift+b").unwrap());
+    }
+
+    #[test]
+    fn parses_function_and_named_keys() {
+        assert_eq!(parse("alt+f2").unwrap().vk, 0x71);
+        assert_eq!(parse("ctrl+shift+space").unwrap().vk, 0x20);
+        assert_eq!(parse("ctrl+f13").unwrap().vk, 0x7C);
     }
 
     #[test]
     fn rejects_missing_modifier() {
         assert!(parse("e").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        assert!(parse("ctrl+banana").is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_function_key() {
+        assert!(parse("ctrl+f25").is_err());
     }
 
     /// O Windows registra modificador + UMA tecla. Acorde tipo "ctrl+x depois 1" nao existe
@@ -149,10 +163,5 @@ mod tests {
     fn rejects_chord_with_two_main_keys() {
         let err = parse("ctrl+x+1").unwrap_err().to_string();
         assert!(err.contains("mais de uma tecla principal"), "{err}");
-    }
-
-    #[test]
-    fn rejects_unknown_key() {
-        assert!(parse("ctrl+banana").is_err());
     }
 }

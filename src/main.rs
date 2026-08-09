@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod hook;
 mod hotkey;
 mod icon;
 mod llm;

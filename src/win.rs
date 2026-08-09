@@ -12,12 +12,14 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_F13, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow, SetForegroundWindow};
 
 const VK_C: VIRTUAL_KEY = VIRTUAL_KEY(0x43);
 const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+/// VK sem funcao atribuida, usada so para mascarar o toque isolado de Alt/Win.
+const VK_MASK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
 
 /// HWND nao e Send; o app guarda o handle como isize para passar entre threads.
 pub fn foreground_window() -> isize {
@@ -103,15 +105,18 @@ fn is_down(vk: VIRTUAL_KEY) -> bool {
 /// O atalho global e disparado com os modificadores ainda pressionados fisicamente.
 /// Sem soltar antes, o Ctrl+C sintetico vira Ctrl+Alt+C na janela alvo.
 fn release_modifiers() {
-    // Com um atalho de Alt (o modo rapido usa alt+b), a janela em foco ja recebeu o
-    // WM_SYSKEYDOWN do Alt, e a tecla principal foi engolida pelo RegisterHotKey. Soltar o Alt
-    // assim vira um toque isolado, e um Alt isolado manda o DefWindowProc abrir a barra de menu:
-    // a janela "responde" ao atalho e o Ctrl+C seguinte cai dentro do menu, sem copiar nada.
-    // Uma tecla inerte no meio tira do Alt a condicao de toque isolado.
-    if is_down(VK_MENU) {
+    // Alt e Win tem acao propria quando sao pressionados e soltos sem mais nada no meio: o Alt
+    // abre a barra de menu da janela em foco, o Win abre o Menu Iniciar. Como o RegisterHotKey
+    // engole a tecla principal do atalho, a janela (e o shell) so veem o modificador — e soltar
+    // ele aqui completa justamente esse toque isolado. O Menu Iniciar rouba o foco, e o Ctrl+C
+    // seguinte vai parar la dentro em vez de copiar a selecao.
+    //
+    // A mascara e um toque numa VK sem funcao nenhuma, o mesmo recurso que o AutoHotkey usa para
+    // segurar Win e Alt: basta existir uma tecla no meio para o toque deixar de ser isolado.
+    if is_down(VK_MENU) || is_down(VK_LWIN) || is_down(VK_RWIN) {
         send(&[
-            key_event(VK_F13, KEYBD_EVENT_FLAGS(0)),
-            key_event(VK_F13, KEYEVENTF_KEYUP),
+            key_event(VK_MASK, KEYBD_EVENT_FLAGS(0)),
+            key_event(VK_MASK, KEYEVENTF_KEYUP),
         ]);
     }
 
