@@ -125,8 +125,14 @@ mod tests {
         assert_eq!(quick.mods, CTRL);
         assert_eq!(quick.vk, 0x53);
 
-        // O roteamento e por atalho: os dois precisam ser distinguiveis.
+        let ticket = parse("ctrl+d").unwrap();
+        assert_eq!(ticket.mods, CTRL);
+        assert_eq!(ticket.vk, 0x44);
+
+        // O roteamento e por atalho: os tres precisam ser distinguiveis.
         assert_ne!(open, quick);
+        assert_ne!(open, ticket);
+        assert_ne!(quick, ticket);
     }
 
     /// Combinacao exata: quem pede ctrl+b nao quer disparar em ctrl+shift+b.

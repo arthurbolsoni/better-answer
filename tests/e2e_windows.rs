@@ -211,12 +211,15 @@ fn write_config(name: &str, quick_hotkey: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("better-answer-e2e-{name}.toml"));
     let mut file = std::fs::File::create(&path).expect("criando config do teste");
     // api_key vazia: o erro e local e imediato, sem chamada de rede.
+    // ticket_hotkey vazio de proposito: o padrao (ctrl+d) seria engolido na maquina inteira
+    // enquanto o teste roda, incluindo o EOF do terminal.
     write!(
         file,
         r#"api_key = ""
 model = "e2e/nao-usado"
 hotkey = "ctrl+alt+shift+f9"
 quick_hotkey = "{quick_hotkey}"
+ticket_hotkey = ""
 temperature = 0.4
 max_tokens = 256
 signature = ""

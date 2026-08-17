@@ -68,6 +68,8 @@ enum HotkeyMsg {
     Show(Box<ShowRequest>),
     /// Atalho rapido: melhora e cola sem abrir janela nenhuma.
     Quick(Box<ShowRequest>),
+    /// Atalho de chamado: abre o popup ja no tom "Chamado".
+    Ticket(Box<ShowRequest>),
     Hide,
 }
 
@@ -85,7 +87,11 @@ pub struct App {
     cfg: Config,
     /// Copia editavel enquanto o painel de configuracao esta aberto.
     draft: Config,
+    /// Tom da geracao atual.
     tone_index: usize,
+    /// Ultimo tom escolhido a mao (pill ou Alt+N). O atalho de chamado forca o tom dele sem mexer
+    /// aqui, senao a proxima abertura pelo atalho normal viria com o tom de chamado grudado.
+    chosen_tone: usize,
     original: String,
     instruction: String,
     output: String,
@@ -152,6 +158,7 @@ impl App {
             draft: cfg.clone(),
             cfg,
             tone_index: 0,
+            chosen_tone: 0,
             original: String::new(),
             instruction: String::new(),
             output: String::new(),
@@ -298,6 +305,20 @@ impl App {
         });
     }
 
+    /// Abre o popup com o texto que o atalho capturou, no tom pedido.
+    fn open_captured(&mut self, ctx: &egui::Context, req: ShowRequest, tone_index: usize) {
+        self.target_hwnd = req.hwnd;
+        self.previous_clipboard = req.previous_clipboard;
+        self.original = req.text;
+        self.instruction.clear();
+        self.output.clear();
+        self.show_settings = false;
+        self.show_original = false;
+        self.tone_index = tone_index;
+        self.show_popup(ctx, Some(req.cursor));
+        self.start_generation(ctx);
+    }
+
     /// Modo rapido: sem popup, so a caixinha ao lado do cursor dizendo em que pe esta. No fim ela
     /// some sozinha e o texto melhorado entra no lugar do original.
     fn start_quick(&mut self, ctx: &egui::Context, req: ShowRequest) {
@@ -318,7 +339,8 @@ impl App {
             previous_clipboard: req.previous_clipboard,
             cursor,
         });
-        let tone = self.cfg.tone(self.tone_index).clone();
+        // O tom aqui e o escolhido a mao, nunca o que o atalho de chamado forcou no popup.
+        let tone = self.cfg.tone(self.chosen_tone).clone();
         self.hud_message = format!("melhorando · {}", tone.name);
         self.note_quick("melhorando...", false);
         self.show_hud(ctx, cursor);
@@ -353,12 +375,7 @@ impl App {
         let Some(tray) = self.tray.as_ref() else {
             return;
         };
-        let quick = if self.cfg.quick_hotkey.trim().is_empty() {
-            "desligado".to_string()
-        } else {
-            self.cfg.quick_hotkey.clone()
-        };
-        let mut tip = format!("better-answer\n{} — popup\n{} — rápido", self.cfg.hotkey, quick);
+        let mut tip = tray_tooltip(&self.cfg);
         if let Some((message, is_error)) = &self.quick_note {
             let prefix = if *is_error { "erro" } else { "rápido" };
             tip.push_str(&format!("\n{prefix}: {message}"));
@@ -372,15 +389,12 @@ impl App {
                 HotkeyMsg::Hide => self.hide_window(ctx, true),
                 HotkeyMsg::Quick(req) => self.start_quick(ctx, *req),
                 HotkeyMsg::Show(req) => {
-                    self.target_hwnd = req.hwnd;
-                    self.previous_clipboard = req.previous_clipboard;
-                    self.original = req.text;
-                    self.instruction.clear();
-                    self.output.clear();
-                    self.show_settings = false;
-                    self.show_original = false;
-                    self.show_popup(ctx, Some(req.cursor));
-                    self.start_generation(ctx);
+                    let tone = self.chosen_tone;
+                    self.open_captured(ctx, *req, tone);
+                }
+                HotkeyMsg::Ticket(req) => {
+                    let tone = self.cfg.ticket_tone_index();
+                    self.open_captured(ctx, *req, tone);
                 }
             }
         }
@@ -698,6 +712,7 @@ impl App {
 
         if let Some(index) = self.tone_bar(ui, ctx) {
             self.tone_index = index;
+            self.chosen_tone = index;
             self.start_generation(ctx);
         }
 
@@ -933,6 +948,14 @@ impl App {
                         );
                         ui.end_row();
 
+                        ui.label("Atalho chamado");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.draft.ticket_hotkey)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("ctrl+d — vazio desliga"),
+                        );
+                        ui.end_row();
+
                         ui.label("Chave OpenRouter");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.draft.api_key)
@@ -990,7 +1013,8 @@ impl App {
                 .clicked()
             {
                 let hotkeys_changed = self.draft.hotkey != self.cfg.hotkey
-                    || self.draft.quick_hotkey != self.cfg.quick_hotkey;
+                    || self.draft.quick_hotkey != self.cfg.quick_hotkey
+                    || self.draft.ticket_hotkey != self.cfg.ticket_hotkey;
                 self.cfg = self.draft.clone();
                 match self.cfg.save() {
                     Ok(()) => {
@@ -1075,6 +1099,7 @@ fn banner(ui: &mut egui::Ui, color: egui::Color32, message: &str) {
 /// Ids que o hook devolve. Fixos, so precisam ser distintos entre si.
 const OPEN_ID: u32 = 1;
 const QUICK_ID: u32 = 2;
+const TICKET_ID: u32 = 3;
 
 struct Registration {
     hotkey_rx: Option<Receiver<u32>>,
@@ -1082,25 +1107,32 @@ struct Registration {
 }
 
 fn register_hotkeys(cfg: &Config) -> Registration {
-    let mut bindings = Vec::new();
+    let mut bindings: Vec<crate::hook::Binding> = Vec::new();
     let mut errors = Vec::new();
 
-    match crate::hotkey::parse(&cfg.hotkey) {
-        Ok(shortcut) => bindings.push(crate::hook::Binding {
-            id: OPEN_ID,
-            shortcut,
-        }),
-        Err(err) => errors.push(format!("atalho '{}' invalido: {err:#}", cfg.hotkey)),
-    }
+    let wanted = [
+        (OPEN_ID, cfg.hotkey.trim(), "atalho"),
+        (QUICK_ID, cfg.quick_hotkey.trim(), "atalho rápido"),
+        (TICKET_ID, cfg.ticket_hotkey.trim(), "atalho de chamado"),
+    ];
 
-    let quick_spec = cfg.quick_hotkey.trim();
-    if !quick_spec.is_empty() {
-        match crate::hotkey::parse(quick_spec) {
-            Ok(shortcut) => bindings.push(crate::hook::Binding {
-                id: QUICK_ID,
-                shortcut,
-            }),
-            Err(err) => errors.push(format!("atalho rápido '{quick_spec}' invalido: {err:#}")),
+    for (id, spec, label) in wanted {
+        // Campo vazio desliga o atalho — menos o do popup, que e o caminho principal e por isso
+        // segue para o parse (e reclama).
+        if spec.is_empty() && id != OPEN_ID {
+            continue;
+        }
+        match crate::hotkey::parse(spec) {
+            Ok(shortcut) => {
+                // O hook roteia pelo primeiro binding que casa: atalho repetido deixaria o
+                // segundo mudo para sempre. Melhor dizer isso na cara.
+                if bindings.iter().any(|b| b.shortcut == shortcut) {
+                    errors.push(format!("{label} '{spec}' repete outro atalho"));
+                    continue;
+                }
+                bindings.push(crate::hook::Binding { id, shortcut });
+            }
+            Err(err) => errors.push(format!("{label} '{spec}' invalido: {err:#}")),
         }
     }
 
@@ -1135,7 +1167,8 @@ fn spawn_hotkey_listener(
         while let Ok(id) = hotkey_rx.recv() {
             let is_quick = id == QUICK_ID;
 
-            // Com o popup aberto, o atalho normal fecha em vez de copiar a propria janela.
+            // Com o popup aberto, os atalhos que abrem popup fecham em vez de copiar a propria
+            // janela (o Ctrl+C sintetico cairia na janela do proprio app).
             let msg = if !is_quick && visible.load(Ordering::SeqCst) {
                 HotkeyMsg::Hide
             } else {
@@ -1149,10 +1182,10 @@ fn spawn_hotkey_listener(
                     previous_clipboard: capture.previous_clipboard,
                     cursor: win::cursor_pos(),
                 });
-                if is_quick {
-                    HotkeyMsg::Quick(request)
-                } else {
-                    HotkeyMsg::Show(request)
+                match id {
+                    QUICK_ID => HotkeyMsg::Quick(request),
+                    TICKET_ID => HotkeyMsg::Ticket(request),
+                    _ => HotkeyMsg::Show(request),
                 }
             };
 
@@ -1182,22 +1215,32 @@ fn build_tray(cfg: &Config) -> (Option<TrayIcon>, MenuId, MenuId) {
         return (None, open_id, quit_id);
     }
 
-    let quick = if cfg.quick_hotkey.trim().is_empty() {
-        "desligado".to_string()
-    } else {
-        cfg.quick_hotkey.clone()
-    };
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(format!(
-            "better-answer\n{} — popup\n{} — rápido",
-            cfg.hotkey, quick
-        ))
+        .with_tooltip(tray_tooltip(cfg))
         .with_icon(tray_icon_image())
         .build()
         .ok();
 
     (tray, open_id, quit_id)
+}
+
+/// Tooltip da bandeja: e o unico lugar onde os atalhos ficam visiveis sem abrir a configuracao.
+fn tray_tooltip(cfg: &Config) -> String {
+    let optional = |spec: &str| {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            "desligado".to_string()
+        } else {
+            spec.to_string()
+        }
+    };
+    format!(
+        "better-answer\n{} — popup\n{} — rápido\n{} — chamado",
+        cfg.hotkey,
+        optional(&cfg.quick_hotkey),
+        optional(&cfg.ticket_hotkey),
+    )
 }
 
 /// Icone 32x32 desenhado em codigo para o binario nao depender de arquivo externo.

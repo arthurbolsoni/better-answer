@@ -4,12 +4,13 @@ Atalho global no Windows que pega o texto selecionado em **qualquer** app, reesc
 (via OpenRouter) e devolve pronto — no tom de um líder que a equipe respeita: claro, cordial e firme,
 sem parecer bruto nem bajulador.
 
-Dois atalhos:
+Três atalhos:
 
 | Atalho | O que faz |
 |---|---|
 | `Ctrl+B` | Abre o popup ao lado do cursor com a versão melhorada. `Ctrl+Enter` cola por cima do original. |
 | `Ctrl+S` | Melhora com o tom padrão e substitui o texto selecionado. Só aparece uma caixinha ao lado do cursor com o progresso, do tamanho de um menu de contexto. |
+| `Ctrl+D` | Abre o popup já no tom **Chamado**: transforma a anotação solta num registro de ocorrência (resumo, quando, onde, o que aconteceu, mensagem de erro, impacto). |
 
 ## Como funciona
 
@@ -31,6 +32,22 @@ Se você cancelar (`Esc`), o clipboard anterior é restaurado.
 ativa, que é o que faz o `Ctrl+V` do final cair no lugar certo. Deu erro, a caixinha mostra o motivo,
 some sozinha depois de 5s e o clipboard anterior é restaurado. O erro também vai para o tooltip da
 bandeja e vira um aviso na próxima vez que o popup abrir.
+
+### O atalho de chamado
+
+`Ctrl+D` é o mesmo popup do `Ctrl+B`, com o tom **Chamado** já selecionado — serve para jogar a
+anotação crua ("sistema travou na tela de faturamento agora, erro X, cliente Y parado") e receber um
+registro de ocorrência limpo: resumo na primeira linha e depois só os rótulos que o texto original
+realmente informa (`Quando`, `Onde`, `O que aconteceu`, `Mensagem de erro`, `Como reproduzir`,
+`Impacto`, `Já verificado`). Rótulo sem informação é omitido em vez de preenchido com suposição, e
+código, ID e mensagem de erro vão transcritos igual.
+
+Ele não substitui o texto sozinho de propósito: chamado se lê antes de mandar. Revise no popup e
+mande com `Ctrl+Enter` (cola no app de origem) ou `Ctrl+Shift+C` (só copia).
+
+O tom é encontrado **pelo nome**, porque a lista de tons é sua para editar: um config antigo, sem o
+tom `Chamado`, ganha ele na próxima abertura do app. Se você renomear ou apagar esse tom, o `Ctrl+D`
+passa a abrir no primeiro tom da lista.
 
 Alt e Win têm ação própria quando são soltos sem nenhuma tecla no meio — barra de menu e Menu
 Iniciar. Como o hook engole a tecla principal, o modificador vira um toque isolado; por isso a
@@ -77,6 +94,7 @@ Primeira execução cria `%APPDATA%\better-answer\config.toml`:
 | `model` | Ex.: `anthropic/claude-sonnet-5`, `google/gemini-3.5-flash`, `openai/gpt-5.6-sol`. |
 | `hotkey` | Atalho do popup. Ex.: `ctrl+b`, `ctrl+alt+e`, `alt+f2`. Exige ao menos um modificador. |
 | `quick_hotkey` | Atalho rápido. Ex.: `ctrl+s`, `win+b`. Vazio desliga. |
+| `ticket_hotkey` | Atalho do chamado. Ex.: `ctrl+d`. Vazio desliga. |
 | `temperature` | Padrão `0.4`. |
 | `max_tokens` | Padrão `2000`. |
 | `signature` | Seu nome/cargo, usado quando o formato pede assinatura. |
@@ -111,7 +129,8 @@ A chave **não** é versionada: o `config.toml` mora no `%APPDATA%`, fora do rep
 | 2 | E-mail formal | Sugere assunto, saudação, corpo e encerramento cortês. |
 | 3 | Direto | Curto e objetivo, sem ficar seco. |
 | 4 | Chat / Teams | Mensagem curta de chat de trabalho. |
-| 5 | Feedback difícil | Fato → impacto → expectativa, sem ataque pessoal. |
+| 5 | Chamado | O tom do `Ctrl+D`. Registro informativo de ocorrência, em linhas rotuladas. |
+| 6 | Feedback difícil | Fato → impacto → expectativa, sem ataque pessoal. |
 
 ## Teclas no popup
 
@@ -122,7 +141,7 @@ A chave **não** é versionada: o `config.toml` mora no `%APPDATA%`, fora do rep
 | `Ctrl+Enter` | Cola no app de origem |
 | `Ctrl+Shift+C` | Copia e fecha |
 | `Esc` | Fecha e restaura o clipboard |
-| `Ctrl+B` | Com o popup aberto, fecha |
+| `Ctrl+B` / `Ctrl+D` | Com o popup aberto, fecham |
 
 O texto de saída é editável antes de colar. O campo de instrução aceita ajustes pontuais
 ("mais curto", "para o cliente", "sem prazo") e regera no `Enter`.
@@ -156,7 +175,10 @@ versões do egui no mesmo binário não compilam, então só a fonte foi vendori
   lê apenas o virtual-key e o estado dos modificadores, encaminha tudo adiante e não guarda nem
   transmite nada — mas é bom saber que a superfície existe.
 - O atalho escolhido é **engolido em todo o sistema** enquanto o app roda. O padrão `ctrl+s` tira o
-  "salvar" de todos os apps; se isso atrapalhar, troque `quick_hotkey` no `config.toml` e reinicie.
+  "salvar" de todos os apps e o `ctrl+d` tira o EOF do terminal e o "duplicar linha / próximo
+  match" dos editores; se isso atrapalhar, troque `quick_hotkey`/`ticket_hotkey` no `config.toml`
+  e reinicie.
+- Dois atalhos com a mesma combinação: o segundo fica mudo. O app avisa em vez de deixar quieto.
 - Apps que não respondem a `Ctrl+C` não entregam seleção — nesses casos o popup abre com o campo
   "original" vazio para você colar/digitar.
 - Colar depende de `Ctrl+V` funcionar na janela de origem.
