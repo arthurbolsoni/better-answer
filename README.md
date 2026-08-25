@@ -80,6 +80,10 @@ foreach ($dir in @([Environment]::GetFolderPath('Startup'), [Environment]::GetFo
 O atalho em `Startup` sobe o app junto com o Windows. O atalho em `Programs` coloca ele no Menu
 Iniciar, em "Todos os aplicativos".
 
+O ícone do `.exe` (Explorer, Menu Iniciar, barra de tarefas, Alt+Tab) é o mesmo da bandeja: o
+desenho vive em `src/brand.rs` e o `build.rs` gera dele um `.ico` de 16 a 256px, embutido como
+recurso Win32 pelo `embed-resource`. Um desenho só, sem arquivo de imagem no repositório.
+
 **Fixar no Menu Iniciar precisa ser manual.** Desde o Windows 10 1903 a Microsoft bloqueia o verbo
 "Fixar em Iniciar" por script — invocá-lo devolve `E_ACCESSDENIED`. Abra o Menu Iniciar, ache
 `better-answer` em "Todos os aplicativos", clique com o botão direito e escolha **Fixar em Iniciar**.

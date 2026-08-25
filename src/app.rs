@@ -708,6 +708,21 @@ impl App {
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // A instrucao e os botoes sao reservados ANTES do corpo, como painel de baixo. Descontar
+        // uma altura fixa do `available_height` nao servia: a fila de tons quebra em duas linhas
+        // conforme o config e o painel ORIGINAL abre sozinho sem selecao, e ai o rodape saia pela
+        // borda da janela — sobrava uma fatia de 2px de "Substituir" para clicar.
+        egui::Panel::bottom("acoes")
+            .frame(egui::Frame::NONE)
+            .resizable(false)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                self.instruction_bar(ui, ctx);
+                ui.add_space(8.0);
+                self.footer(ui, ctx);
+            });
+
         ui.add_space(10.0);
 
         if let Some(index) = self.tone_bar(ui, ctx) {
@@ -745,9 +760,8 @@ impl App {
 
         ui.add_space(8.0);
 
-        // O resultado domina a janela: e o que a pessoa veio ler.
-        let reserved = 34.0 + 30.0 + 10.0; // instrucao + rodape + respiros
-        let body_height = (ui.available_height() - reserved).max(90.0);
+        // O resultado domina o que sobrou: e o que a pessoa veio ler, e agora encolher aqui e a
+        // unica coisa que o aperto de espaco pode fazer.
         egui::Frame::new()
             .fill(PANEL)
             .corner_radius(10.0)
@@ -755,7 +769,6 @@ impl App {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height(body_height)
                     .stick_to_bottom(matches!(self.status, Status::Loading))
                     .show(ui, |ui| match &self.status {
                         Status::NoSelection if self.output.is_empty() => {
@@ -784,11 +797,6 @@ impl App {
                         }
                     });
             });
-
-        ui.add_space(8.0);
-        self.instruction_bar(ui, ctx);
-        ui.add_space(8.0);
-        self.footer(ui, ctx);
     }
 
     /// Pills de tom. Devolve o indice pedido, por clique ou por Alt+1..9.
@@ -917,9 +925,55 @@ impl App {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Mesmo motivo do popup: Salvar/Cancelar sao painel de baixo, senao a lista de campos
+        // empurra os botoes para fora da janela.
+        egui::Panel::bottom("acoes_config")
+            .frame(egui::Frame::NONE)
+            .resizable(false)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Salvar").size(11.5).color(BG))
+                                .fill(ACCENT)
+                                .corner_radius(8.0),
+                        )
+                        .clicked()
+                    {
+                        let hotkeys_changed = self.draft.hotkey != self.cfg.hotkey
+                            || self.draft.quick_hotkey != self.cfg.quick_hotkey
+                            || self.draft.ticket_hotkey != self.cfg.ticket_hotkey;
+                        self.cfg = self.draft.clone();
+                        match self.cfg.save() {
+                            Ok(()) => {
+                                self.sync_tray_tooltip();
+                                if hotkeys_changed {
+                                    self.toast("salvo — reinicie para os novos atalhos valerem");
+                                } else {
+                                    self.toast("salvo");
+                                }
+                                self.show_settings = false;
+                            }
+                            Err(err) => self.status = Status::Error(format!("{err:#}")),
+                        }
+                    }
+                    if ghost_button(ui, "Cancelar", true).clicked() {
+                        self.draft = self.cfg.clone();
+                        self.show_settings = false;
+                    }
+                    if let Some((message, at)) = self.toast.clone() {
+                        if at.elapsed() < Duration::from_secs(3) {
+                            ui.label(egui::RichText::new(message).size(11.0).color(ACCENT));
+                        }
+                    }
+                    let _ = ctx;
+                });
+            });
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .max_height(ui.available_height() - 42.0)
             .show(ui, |ui| {
                 egui::Grid::new("settings")
                     .num_columns(2)
@@ -1002,44 +1056,6 @@ impl App {
                 }
             });
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("Salvar").size(11.5).color(BG))
-                        .fill(ACCENT)
-                        .corner_radius(8.0),
-                )
-                .clicked()
-            {
-                let hotkeys_changed = self.draft.hotkey != self.cfg.hotkey
-                    || self.draft.quick_hotkey != self.cfg.quick_hotkey
-                    || self.draft.ticket_hotkey != self.cfg.ticket_hotkey;
-                self.cfg = self.draft.clone();
-                match self.cfg.save() {
-                    Ok(()) => {
-                        self.sync_tray_tooltip();
-                        if hotkeys_changed {
-                            self.toast("salvo — reinicie para os novos atalhos valerem");
-                        } else {
-                            self.toast("salvo");
-                        }
-                        self.show_settings = false;
-                    }
-                    Err(err) => self.status = Status::Error(format!("{err:#}")),
-                }
-            }
-            if ghost_button(ui, "Cancelar", true).clicked() {
-                self.draft = self.cfg.clone();
-                self.show_settings = false;
-            }
-            if let Some((message, at)) = self.toast.clone() {
-                if at.elapsed() < Duration::from_secs(3) {
-                    ui.label(egui::RichText::new(message).size(11.0).color(ACCENT));
-                }
-            }
-            let _ = ctx;
-        });
     }
 }
 
@@ -1243,53 +1259,10 @@ fn tray_tooltip(cfg: &Config) -> String {
     )
 }
 
-/// Icone 32x32 desenhado em codigo para o binario nao depender de arquivo externo.
+/// Icone 32x32 da bandeja. O desenho e o mesmo que o `build.rs` embute no `.exe`.
 fn tray_icon_image() -> tray_icon::Icon {
     const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let radius = 6i32;
-
-    for y in 0..SIZE as i32 {
-        for x in 0..SIZE as i32 {
-            let index = ((y as u32 * SIZE + x as u32) * 4) as usize;
-
-            // Canto arredondado: fora do raio nos cantos, deixa transparente.
-            let cx = if x < radius {
-                radius - x
-            } else if x >= SIZE as i32 - radius {
-                x - (SIZE as i32 - radius - 1)
-            } else {
-                0
-            };
-            let cy = if y < radius {
-                radius - y
-            } else if y >= SIZE as i32 - radius {
-                y - (SIZE as i32 - radius - 1)
-            } else {
-                0
-            };
-            if cx * cx + cy * cy > radius * radius {
-                continue;
-            }
-
-            let bars = [(9, 7, 25), (15, 7, 21), (21, 7, 17)];
-            let on_bar = bars
-                .iter()
-                .any(|(by, x0, x1)| (y - by).abs() <= 1 && x >= *x0 && x <= *x1);
-
-            let (r, g, b) = if on_bar {
-                (255, 255, 255)
-            } else {
-                (47, 107, 255)
-            };
-            rgba[index] = r;
-            rgba[index + 1] = g;
-            rgba[index + 2] = b;
-            rgba[index + 3] = 255;
-        }
-    }
-
-    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("icone 32x32 valido")
+    tray_icon::Icon::from_rgba(crate::brand::rgba(SIZE), SIZE, SIZE).expect("icone 32x32 valido")
 }
 
 fn style(ctx: &egui::Context) {
